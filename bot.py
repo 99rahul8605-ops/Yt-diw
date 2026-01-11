@@ -3,11 +3,14 @@ import logging
 import asyncio
 import tempfile
 import html
+import threading
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, List
 from dotenv import load_dotenv
-from aiohttp import web
+import signal
+import sys
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -38,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 10000))  # Render uses port 10000 by default
 MAX_FILE_SIZE = 2000 * 1024 * 1024
 TEMP_DIR = Path("temp")
 COOKIES_DIR = Path("cookies")
@@ -837,65 +840,99 @@ class YouTubeDownloadBot:
             except Exception as e:
                 logger.error(f"Error in error handler: {e}")
 
-async def start_web_server():
-    """Start a simple web server for Render health checks."""
-    app = web.Application()
-    
-    # Health check endpoint
-    async def health_check(request):
-        return web.Response(text="✅ YouTube Downloader Bot is running", status=200)
-    
-    # Main page
-    async def index(request):
-        html_content = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>YouTube Downloader Bot</title>
-            <style>
-                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-                .container { background: #f5f5f5; padding: 30px; border-radius: 10px; }
-                .status { color: green; font-weight: bold; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🎬 YouTube Downloader Bot</h1>
-                <p class="status">✅ Bot is running and operational</p>
-                <p>This bot helps you download YouTube videos with multiple quality options.</p>
-                <h3>Features:</h3>
-                <ul>
-                    <li>📥 Download individual YouTube videos</li>
-                    <li>📁 Bulk download via .txt files</li>
-                    <li>🎯 Multiple resolution support</li>
-                    <li>🍪 YouTube cookies integration</li>
-                    <li>⚡ Real-time progress tracking</li>
-                </ul>
-                <p>Start using the bot on Telegram: <a href="https://t.me/your_bot_username" target="_blank">@YouTubeDownloaderBot</a></p>
-                <p><small>Last updated: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</small></p>
-            </div>
-        </body>
-        </html>
-        """
-        return web.Response(text=html_content, content_type='text/html')
-    
-    app.router.add_get('/', index)
-    app.router.add_get('/health', health_check)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    
-    logger.info(f"🌐 Web server started on port {PORT}")
-    logger.info(f"📡 Health check available at: http://0.0.0.0:{PORT}/health")
-    
-    return runner
+def start_flask_server():
+    """Start a simple Flask web server in a separate thread for Render."""
+    try:
+        from flask import Flask, jsonify
+        import threading
+        
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def index():
+            return jsonify({
+                "status": "running",
+                "service": "YouTube Downloader Bot",
+                "version": "2.1.0",
+                "timestamp": datetime.now().isoformat()
+            })
+        
+        @app.route('/health')
+        def health():
+            return jsonify({"status": "healthy"}), 200
+        
+        # Run Flask in a separate thread
+        def run_flask():
+            app.run(host='0.0.0.0', port=PORT, threaded=True, debug=False)
+        
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        
+        logger.info(f"🌐 Flask server started on port {PORT}")
+        logger.info(f"📡 Health check available at: http://0.0.0.0:{PORT}/health")
+        
+        return True
+    except ImportError:
+        logger.warning("Flask not installed. Web server will not start.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to start Flask server: {e}")
+        return False
 
-async def main():
-    """Main function to start both bot and web server."""
+def start_simple_http_server():
+    """Start a simple HTTP server in a separate thread."""
+    try:
+        import http.server
+        import socketserver
+        import threading
+        
+        handler = http.server.SimpleHTTPRequestHandler
+        
+        def run_server():
+            with socketserver.TCPServer(("", PORT), handler) as httpd:
+                logger.info(f"🌐 Simple HTTP server started on port {PORT}")
+                httpd.serve_forever()
+        
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to start HTTP server: {e}")
+        return False
+
+def start_web_server():
+    """Try to start a web server for Render health checks."""
+    logger.info(f"🚀 Attempting to start web server on port {PORT}")
+    
+    # Try Flask first, then simple HTTP server
+    if not start_flask_server():
+        if not start_simple_http_server():
+            logger.warning("⚠️ Could not start web server. Render may show as unhealthy.")
+            return False
+    return True
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals."""
+    logger.info(f"Received signal {signum}. Shutting down...")
+    sys.exit(0)
+
+def main():
+    """Main function to start the bot."""
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable not set")
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start web server for Render health checks (in separate thread)
+    web_server_started = start_web_server()
+    
+    if web_server_started:
+        logger.info(f"✅ Web server is running on port {PORT}")
+        logger.info("🔍 Render health checks should pass")
+    else:
+        logger.warning("❌ Web server failed to start")
     
     bot = YouTubeDownloadBot()
     
@@ -928,23 +965,23 @@ async def main():
     # Error handler
     application.add_error_handler(bot.error_handler)
     
-    # Start web server for Render (in background)
-    web_runner = await start_web_server()
-    
-    logger.info("🤖 Bot is starting...")
+    logger.info("🤖 Starting YouTube Downloader Bot...")
     logger.info(f"📁 Temp directory: {TEMP_DIR}")
     logger.info(f"🍪 Cookies directory: {COOKIES_DIR}")
-    logger.info(f"🌐 Bot will run with web server on port {PORT}")
+    logger.info(f"🌐 Web server port: {PORT}")
     
+    # Start the bot with polling
     try:
-        # Start the bot
-        await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False  # Don't close the loop, we have other threads
+        )
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
-    finally:
-        # Cleanup web server
-        await web_runner.cleanup()
-        logger.info("Web server stopped")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        raise
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
