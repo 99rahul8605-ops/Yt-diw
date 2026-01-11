@@ -1,8 +1,8 @@
-python-telegram-bot==20.7
-yt-dlp==2024.7.23  # Updated to latest version
+python-telegram-bot[job-queue]==20.7
+python-dotenv==1.0.0
+yt-dlp==2025.1.26
 aiofiles==23.2.1
 aiohttp==3.9.3
-python-dotenv==1.0.0
 pillow==10.2.0
 emoji==2.10.1
 pytz==2024.1
