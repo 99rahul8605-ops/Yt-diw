@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
@@ -43,11 +43,9 @@ COOKIES_DIR = Path("cookies")
 TEMP_DIR.mkdir(exist_ok=True)
 COOKIES_DIR.mkdir(exist_ok=True)
 
-# Conversation states
-CHOOSING_RESOLUTION, PROCESSING_BULK, UPLOADING = range(3)
-
 # Store user states
 user_states: Dict[int, Dict] = {}
+waiting_for_cookies: Dict[int, bool] = {}
 
 class YouTubeDownloadBot:
     def __init__(self):
@@ -75,20 +73,24 @@ class YouTubeDownloadBot:
             "/start - Start the bot\n"
             "/help - Show help message\n"
             "/update_cookies - Update YouTube cookies\n"
+            "/cookies_help - Cookies troubleshooting\n"
             "/status - Check bot status\n"
+            "/cancel - Cancel current operation\n"
         )
         
         await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
         
-        # Send bot capabilities
-        capabilities = (
-            "🚀 **Ready to download!**\n\n"
-            "👇 **Send me:**\n"
-            "• A YouTube URL to download single video\n"
-            "• A .txt file with multiple URLs (one per line)\n"
-            "• A cookies.txt file to update cookies\n"
-        )
-        await update.message.reply_text(capabilities, parse_mode=ParseMode.MARKDOWN)
+        # Check if cookies are configured
+        user_id = update.effective_user.id
+        cookie_status = self.cookie_manager.get_cookies_status(user_id)
+        
+        if not cookie_status['has_cookies']:
+            cookies_note = (
+                "\n⚠️ **Note:** You haven't configured cookies yet.\n"
+                "Some videos may require cookies to download.\n"
+                "Use /update_cookies to add cookies file."
+            )
+            await update.message.reply_text(cookies_note, parse_mode=ParseMode.MARKDOWN)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a help message."""
@@ -120,11 +122,107 @@ class YouTubeDownloadBot:
 
     async def update_cookies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Initiate cookie update process."""
-        await update.message.reply_text(
+        user_id = update.effective_user.id
+        waiting_for_cookies[user_id] = True
+        
+        instructions = (
             "🍪 **Update YouTube Cookies**\n\n"
-            "Please send me a cookies.txt file.\n"
-            "This helps download age-restricted or private videos.\n\n"
-            "⚠️ Note: Your cookies are stored securely and only used for downloading."
+            "**Why cookies?**\n"
+            "• Download age-restricted videos\n"
+            "• Avoid 'Sign in to confirm you're not a bot' errors\n"
+            "• Access private/unlisted videos\n\n"
+            "**How to get cookies:**\n"
+            "1. Install 'Get cookies.txt' browser extension\n"
+            "2. Login to YouTube in your browser\n"
+            "3. Go to any YouTube video\n"
+            "4. Click the extension and export cookies\n"
+            "5. Send the cookies.txt file to this bot\n\n"
+            "**Privacy:** Your cookies are stored securely and only used for downloading.\n\n"
+            "👇 **Now send me your cookies.txt file:**\n"
+            "(or send /cancel to cancel)"
+        )
+        
+        # Check current cookie status
+        cookie_status = self.cookie_manager.get_cookies_status(user_id)
+        
+        if cookie_status['has_cookies']:
+            instructions += f"\n\n📊 **Current Status:**\n{cookie_status['message']}"
+        
+        await update.message.reply_text(instructions, parse_mode=ParseMode.MARKDOWN)
+
+    async def cookies_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Detailed help for cookies troubleshooting."""
+        help_text = (
+            "🔧 **Cookies Troubleshooting Guide**\n\n"
+            "**Common Issues & Solutions:**\n\n"
+            "1. **'Sign in to confirm you're not a bot' error**\n"
+            "   • Update your cookies using /update_cookies\n"
+            "   • Make sure you're logged into YouTube in browser\n"
+            "   • Export cookies while on youtube.com\n\n"
+            "2. **Age-restricted videos not downloading**\n"
+            "   • Cookies must contain login information\n"
+            "   • Re-export cookies after fresh login\n"
+            "   • Use Chrome for best results\n\n"
+            "3. **How to export cookies (Chrome):**\n"
+            "   a. Install 'Get cookies.txt' extension\n"
+            "   b. Login to youtube.com\n"
+            "   c. Click the extension icon\n"
+            "   d. Click 'Export' button\n"
+            "   e. Send the file to bot\n\n"
+            "4. **Still having issues?**\n"
+            "   • Try clearing browser cookies and re-login\n"
+            "   • Use Incognito mode for clean cookies\n"
+            "   • Contact support if problem persists\n"
+        )
+        
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel the current operation."""
+        user_id = update.effective_user.id
+        
+        if user_id in waiting_for_cookies:
+            del waiting_for_cookies[user_id]
+            await update.message.reply_text("✅ Cookie update cancelled.")
+        elif user_id in user_states:
+            del user_states[user_id]
+            await update.message.reply_text("✅ Operation cancelled.")
+        else:
+            await update.message.reply_text("ℹ️ No active operation to cancel.")
+
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all document uploads - both cookies and bulk files."""
+        user_id = update.effective_user.id
+        document = update.message.document
+        file_name = document.file_name.lower()
+        
+        # Check if user is waiting for cookies
+        if user_id in waiting_for_cookies and waiting_for_cookies[user_id]:
+            # Handle as cookies file
+            await self.handle_cookies_file(update, context)
+            return
+        
+        # Check if it's a .txt file (for bulk download)
+        if file_name.endswith('.txt'):
+            # Check if it might be a cookies file
+            if file_name == 'cookies.txt':
+                await update.message.reply_text(
+                    "📄 This looks like a cookies file.\n"
+                    "If you want to update cookies, use /update_cookies first.\n"
+                    "If this is a file with YouTube links, please rename it to something else."
+                )
+                return
+            
+            # Handle as bulk download file
+            await self.handle_bulk_file(update, context)
+            return
+        
+        # If not .txt file
+        await update.message.reply_text(
+            "❌ Unsupported file type.\n"
+            "Please send:\n"
+            "• A .txt file with YouTube links for bulk download\n"
+            "• A cookies.txt file (use /update_cookies first)"
         )
 
     async def handle_cookies_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,99 +233,65 @@ class YouTubeDownloadBot:
             # Get the document
             document = update.message.document
             
-            if document.file_name != 'cookies.txt':
-                await update.message.reply_text("❌ Please send a file named 'cookies.txt'")
+            # Check if it's a text file
+            if not document.file_name.endswith('.txt'):
+                await update.message.reply_text(
+                    "❌ Please send a .txt file.\n"
+                    "The file should be named 'cookies.txt'"
+                )
                 return
-                
+            
+            # Send processing message
+            status_msg = await update.message.reply_text("🔍 Processing cookies file...")
+            
             # Download the file
             file = await context.bot.get_file(document.file_id)
-            temp_path = TEMP_DIR / f"cookies_{user_id}.txt"
+            temp_path = TEMP_DIR / f"cookies_{user_id}_{datetime.now().timestamp()}.txt"
             await file.download_to_drive(temp_path)
             
             # Update cookies
-            success = self.cookie_manager.update_cookies(temp_path, user_id)
+            result = self.cookie_manager.update_cookies(temp_path, user_id)
             
-            if success:
-                await update.message.reply_text(
-                    "✅ Cookies updated successfully!\n"
-                    "You can now download age-restricted videos."
-                )
-            else:
-                await update.message.reply_text("❌ Failed to update cookies. Please check the file format.")
+            if result['success']:
+                # Verify cookies work
+                await status_msg.edit_text("✅ Cookies saved! Verifying...")
                 
+                verification = await self.downloader.verify_cookies(user_id)
+                
+                if verification:
+                    final_message = (
+                        f"{result['message']}\n\n"
+                        f"🔍 **Verification:** ✅ Working!\n"
+                        f"You can now download all types of videos."
+                    )
+                else:
+                    final_message = (
+                        f"{result['message']}\n\n"
+                        f"⚠️ **Note:** Cookies saved but may need refresh.\n"
+                        "Try downloading a video to test."
+                    )
+                
+                # Clear waiting state
+                if user_id in waiting_for_cookies:
+                    del waiting_for_cookies[user_id]
+            else:
+                final_message = result['message']
+            
+            await status_msg.edit_text(final_message, parse_mode=ParseMode.MARKDOWN)
+            
             # Cleanup
             temp_path.unlink(missing_ok=True)
             
         except Exception as e:
             logger.error(f"Error updating cookies: {e}")
-            await update.message.reply_text("❌ Error processing cookies file.")
-
-    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages containing YouTube URLs."""
-        text = update.message.text.strip()
-        user_id = update.effective_user.id
-        
-        # Check if it's a YouTube URL
-        if not self.downloader.is_youtube_url(text):
-            await update.message.reply_text("❌ Please send a valid YouTube URL")
-            return
-            
-        # Get video info
-        status_msg = await update.message.reply_text("🔍 Fetching video information...")
-        
-        try:
-            video_info = await self.downloader.get_video_info(text, user_id)
-            
-            if not video_info:
-                await status_msg.edit_text("❌ Failed to fetch video information")
-                return
-                
-            # Store video info for this user
-            user_states[user_id] = {
-                'video_url': text,
-                'video_info': video_info,
-                'status_message': status_msg
-            }
-            
-            # Create resolution buttons
-            keyboard = []
-            for format_info in video_info['formats']:
-                button_text = f"{format_info['resolution']} ({format_info['ext']})"
-                callback_data = f"res:{format_info['format_id']}"
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            # Send video info with thumbnail
-            caption = (
-                f"🎬 **{video_info['title']}**\n\n"
-                f"📊 **Duration:** {video_info['duration_string']}\n"
-                f"👁️ **Views:** {video_info['view_count']:,}\n"
-                f"👍 **Likes:** {video_info['like_count']:,}\n"
-                f"📅 **Upload Date:** {video_info['upload_date']}\n\n"
-                f"👇 **Select Resolution:**"
+            await update.message.reply_text(
+                "❌ Error processing cookies file.\n"
+                "Please ensure you're sending a valid cookies.txt file."
             )
             
-            # Send thumbnail if available
-            if video_info.get('thumbnail'):
-                await update.message.reply_photo(
-                    photo=video_info['thumbnail'],
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=reply_markup
-                )
-            else:
-                await update.message.reply_text(
-                    caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=reply_markup
-                )
-                
-            await status_msg.delete()
-            
-        except Exception as e:
-            logger.error(f"Error getting video info: {e}")
-            await status_msg.edit_text("❌ Error fetching video information")
+            # Clear waiting state on error
+            if user_id in waiting_for_cookies:
+                del waiting_for_cookies[user_id]
 
     async def handle_bulk_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle bulk download via .txt file."""
@@ -256,40 +320,66 @@ class YouTubeDownloadBot:
                 
             # Validate URLs
             valid_urls = []
+            invalid_urls = []
+            
             for url in urls:
                 if self.downloader.is_youtube_url(url):
                     valid_urls.append(url)
+                else:
+                    invalid_urls.append(url)
                     
             if not valid_urls:
-                await update.message.reply_text("❌ No valid YouTube URLs found")
+                await update.message.reply_text(
+                    "❌ No valid YouTube URLs found in the file.\n"
+                    "Please make sure each line contains a valid YouTube URL."
+                )
                 temp_path.unlink()
                 return
                 
-            # Store bulk info
-            user_states[user_id] = {
-                'bulk_urls': valid_urls,
-                'current_index': 0,
-                'total_count': len(valid_urls)
-            }
+            # Show summary
+            summary = (
+                f"📁 **Bulk Download Detected**\n\n"
+                f"📊 **Files found:** {len(urls)} lines\n"
+                f"✅ **Valid YouTube URLs:** {len(valid_urls)}\n"
+            )
+            
+            if invalid_urls:
+                summary += f"❌ **Invalid URLs:** {len(invalid_urls)}\n"
+                if len(invalid_urls) <= 5:
+                    summary += "\nInvalid URLs:\n"
+                    for url in invalid_urls[:5]:
+                        summary += f"• {url[:50]}...\n"
             
             # Ask for resolution
             keyboard = [
                 [
-                    InlineKeyboardButton("360p", callback_data="bulk_res:18"),
-                    InlineKeyboardButton("480p", callback_data="bulk_res:135"),
+                    InlineKeyboardButton("360p", callback_data=f"bulk_res:18_{len(valid_urls)}"),
+                    InlineKeyboardButton("480p", callback_data=f"bulk_res:135_{len(valid_urls)}"),
                 ],
                 [
-                    InlineKeyboardButton("720p", callback_data="bulk_res:22"),
-                    InlineKeyboardButton("1080p", callback_data="bulk_res:137"),
+                    InlineKeyboardButton("720p", callback_data=f"bulk_res:22_{len(valid_urls)}"),
+                    InlineKeyboardButton("1080p", callback_data=f"bulk_res:137_{len(valid_urls)}"),
+                ],
+                [
+                    InlineKeyboardButton("Best Quality", callback_data=f"bulk_res:best_{len(valid_urls)}"),
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
+            summary += f"\n👇 **Select resolution for {len(valid_urls)} videos:**"
+            
+            # Store bulk info
+            user_states[user_id] = {
+                'bulk_urls': valid_urls,
+                'current_index': 0,
+                'total_count': len(valid_urls),
+                'invalid_urls': invalid_urls
+            }
+            
             await update.message.reply_text(
-                f"📁 **Bulk Download Detected**\n\n"
-                f"📊 **Files found:** {len(valid_urls)} videos\n"
-                f"👇 **Select resolution for all videos:**",
-                reply_markup=reply_markup
+                summary,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
             )
             
             # Cleanup
@@ -297,7 +387,108 @@ class YouTubeDownloadBot:
             
         except Exception as e:
             logger.error(f"Error handling bulk file: {e}")
-            await update.message.reply_text("❌ Error processing bulk file")
+            await update.message.reply_text(
+                f"❌ Error processing bulk file:\n{str(e)[:200]}"
+            )
+
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text messages containing YouTube URLs."""
+        text = update.message.text.strip()
+        user_id = update.effective_user.id
+        
+        # Check if it's a YouTube URL
+        if not self.downloader.is_youtube_url(text):
+            await update.message.reply_text(
+                "❌ Please send a valid YouTube URL.\n"
+                "Example: https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            )
+            return
+            
+        # Get video info
+        status_msg = await update.message.reply_text("🔍 Fetching video information...")
+        
+        try:
+            video_info = await self.downloader.get_video_info(text, user_id)
+            
+            if not video_info:
+                await status_msg.edit_text(
+                    "❌ Failed to fetch video information.\n"
+                    "Possible reasons:\n"
+                    "• Video is private/restricted\n"
+                    "• Need updated cookies (use /update_cookies)\n"
+                    "• Network error"
+                )
+                return
+                
+            # Store video info for this user
+            user_states[user_id] = {
+                'video_url': text,
+                'video_info': video_info,
+                'status_message': status_msg
+            }
+            
+            # Create resolution buttons
+            keyboard = []
+            formats_added = set()
+            
+            for format_info in video_info['formats']:
+                format_id = format_info['format_id']
+                if format_id not in formats_added:
+                    button_text = f"{format_info['resolution']} ({format_info['ext']})"
+                    
+                    # Add file size if available
+                    if format_info.get('filesize'):
+                        size_mb = format_info['filesize'] / (1024 * 1024)
+                        button_text += f" [{size_mb:.1f}MB]"
+                    
+                    callback_data = f"res:{format_info['format_id']}"
+                    keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+                    formats_added.add(format_id)
+            
+            # Add best quality option
+            keyboard.append([InlineKeyboardButton("🌟 Best Quality Available", callback_data="res:best")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Send video info with thumbnail
+            caption = (
+                f"🎬 **{video_info['title']}**\n\n"
+                f"📊 **Duration:** {video_info['duration_string']}\n"
+                f"👁️ **Views:** {video_info['view_count']:,}\n"
+                f"👤 **Channel:** {video_info['channel']}\n"
+                f"📅 **Upload Date:** {video_info['upload_date']}\n\n"
+                f"👇 **Select Resolution:**"
+            )
+            
+            # Send thumbnail if available
+            if video_info.get('thumbnail'):
+                try:
+                    await update.message.reply_photo(
+                        photo=video_info['thumbnail'],
+                        caption=caption,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup
+                    )
+                except:
+                    await update.message.reply_text(
+                        caption,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup
+                    )
+            else:
+                await update.message.reply_text(
+                    caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+                
+            await status_msg.delete()
+            
+        except Exception as e:
+            logger.error(f"Error getting video info: {e}")
+            await status_msg.edit_text(
+                f"❌ Error fetching video information:\n{str(e)[:200]}"
+            )
 
     async def handle_resolution_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle resolution selection from inline keyboard."""
@@ -325,21 +516,27 @@ class YouTubeDownloadBot:
             
         elif callback_data.startswith('bulk_res:'):
             # Bulk download
-            format_id = callback_data.split(':')[1]
-            await self.process_bulk_download(query, user_id, format_id)
+            parts = callback_data.split(':')[1].split('_')
+            format_id = parts[0]
+            video_count = int(parts[1]) if len(parts) > 1 else 0
+            
+            await self.process_bulk_download(query, user_id, format_id, video_count)
 
     async def download_and_send_video(self, query, video_url, format_id, user_id, video_info):
         """Download and send a single video."""
         try:
             # Update status
-            status_msg = await query.message.reply_text("⏬ Starting download...")
+            status_msg = await query.message.reply_text(
+                f"⏬ **Starting download...**\n"
+                f"🎬 **{video_info['title'][:50]}...**\n"
+                f"🎯 **Quality:** {format_id if format_id != 'best' else 'Best Available'}"
+            )
             
             # Create progress handler
             progress_msg = await query.message.reply_text(
-                f"📥 **Downloading:** {video_info['title']}\n"
-                f"📊 **Resolution:** {format_id}\n"
-                f"⏳ **Progress:** 0%\n"
-                f"🔄 **Status:** Starting..."
+                f"📥 **Downloading:** {video_info['title'][:50]}...\n"
+                f"📊 **Progress:** 0%\n"
+                f"🔄 **Status:** Preparing..."
             )
             
             # Download with progress
@@ -353,39 +550,58 @@ class YouTubeDownloadBot:
             )
             
             if not download_result['success']:
-                await progress_msg.edit_text(f"❌ Download failed: {download_result.get('error', 'Unknown error')}")
+                await progress_msg.edit_text(
+                    f"❌ **Download failed**\n"
+                    f"**Error:** {download_result.get('error', 'Unknown error')}"
+                )
+                await status_msg.delete()
                 return
                 
             # Upload to Telegram
             await progress_msg.edit_text(
                 f"✅ **Download Complete!**\n"
                 f"📤 **Now Uploading to Telegram...**\n"
+                f"📦 **Size:** {download_result['file_size_mb']:.1f} MB\n"
                 f"⏳ **Progress:** 0%"
             )
             
-            # Send video with thumbnail
+            # Create caption
             caption = (
                 f"🎬 **{video_info['title']}**\n"
-                f"📊 **Resolution:** {download_result['resolution']}\n"
-                f"📦 **Size:** {download_result['file_size_mb']:.2f} MB\n"
-                f"⏱️ **Duration:** {video_info['duration_string']}\n\n"
+                f"📊 **Quality:** {download_result.get('resolution_display', download_result['resolution'])}\n"
+                f"📦 **Size:** {download_result['file_size_mb']:.1f} MB\n"
+                f"⏱️ **Duration:** {video_info['duration_string']}\n"
+                f"👤 **Channel:** {video_info['channel']}\n\n"
                 f"✅ Downloaded via @YouTubeDownloaderBot"
             )
             
-            # Send video
-            with open(download_result['filepath'], 'rb') as video_file:
-                await query.message.reply_video(
-                    video=InputFile(video_file, filename=download_result['filename']),
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    duration=video_info['duration'],
-                    width=download_result.get('width', 1280),
-                    height=download_result.get('height', 720),
-                    supports_streaming=True,
-                    read_timeout=300,
-                    write_timeout=300,
-                    connect_timeout=300,
-                    pool_timeout=300
+            # Send video with progress tracking
+            try:
+                with open(download_result['filepath'], 'rb') as video_file:
+                    # Start upload
+                    await query.message.reply_video(
+                        video=InputFile(
+                            video_file, 
+                            filename=download_result['filename']
+                        ),
+                        caption=caption,
+                        parse_mode=ParseMode.MARKDOWN,
+                        duration=video_info['duration'],
+                        width=download_result.get('width', 1280),
+                        height=download_result.get('height', 720),
+                        supports_streaming=True,
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=300,
+                        pool_timeout=300
+                    )
+            except Exception as e:
+                logger.error(f"Error uploading video: {e}")
+                await query.message.reply_text(
+                    f"✅ **Download Complete!**\n"
+                    f"📦 **Size:** {download_result['file_size_mb']:.1f} MB\n\n"
+                    f"❌ **Upload failed:** {str(e)[:100]}\n"
+                    f"The file was downloaded but couldn't be sent to Telegram."
                 )
             
             # Cleanup
@@ -395,14 +611,20 @@ class YouTubeDownloadBot:
             # Remove downloaded file
             Path(download_result['filepath']).unlink(missing_ok=True)
             
+            # Clear user state
+            if user_id in user_states:
+                del user_states[user_id]
+            
         except Exception as e:
             logger.error(f"Error in download_and_send_video: {e}")
-            await query.message.reply_text(f"❌ Error: {str(e)}")
+            await query.message.reply_text(
+                f"❌ **Error processing video:**\n{str(e)[:200]}"
+            )
 
-    async def process_bulk_download(self, query, user_id, format_id):
+    async def process_bulk_download(self, query, user_id, format_id, video_count):
         """Process bulk download queue."""
         if user_id not in user_states:
-            await query.edit_message_text("❌ Session expired.")
+            await query.edit_message_text("❌ Session expired. Please send the file again.")
             return
             
         bulk_info = user_states[user_id]
@@ -411,24 +633,36 @@ class YouTubeDownloadBot:
         await query.edit_message_text(
             f"📁 **Bulk Download Started**\n\n"
             f"📊 **Total Videos:** {len(urls)}\n"
-            f"🎯 **Resolution:** {format_id}\n"
+            f"🎯 **Quality:** {format_id if format_id != 'best' else 'Best Available'}\n"
             f"⏳ **Processing...**"
         )
         
         success_count = 0
         failed_count = 0
+        failed_videos = []
         
         for i, url in enumerate(urls, 1):
             try:
+                # Status message
+                status_msg = await query.message.reply_text(
+                    f"🔄 **Processing {i}/{len(urls)}**\n"
+                    f"📥 Getting video info..."
+                )
+                
                 # Get video info
                 video_info = await self.downloader.get_video_info(url, user_id)
                 
                 if not video_info:
+                    await status_msg.edit_text(
+                        f"❌ **Failed {i}/{len(urls)}**\n"
+                        f"Could not get video info"
+                    )
                     failed_count += 1
+                    failed_videos.append(f"{url} - Info not found")
+                    await asyncio.sleep(2)
                     continue
-                    
-                # Status message
-                status_msg = await query.message.reply_text(
+                
+                await status_msg.edit_text(
                     f"🔄 **Processing {i}/{len(urls)}**\n"
                     f"🎬 **{video_info['title'][:50]}...**\n"
                     f"📥 Downloading..."
@@ -444,36 +678,71 @@ class YouTubeDownloadBot:
                 
                 if download_result['success']:
                     # Send video
-                    with open(download_result['filepath'], 'rb') as video_file:
-                        await query.message.reply_video(
-                            video=InputFile(video_file),
-                            caption=f"🎬 {video_info['title']}",
-                            supports_streaming=True
+                    try:
+                        with open(download_result['filepath'], 'rb') as video_file:
+                            await query.message.reply_video(
+                                video=InputFile(video_file),
+                                caption=f"🎬 {video_info['title'][:100]}",
+                                supports_streaming=True
+                            )
+                        success_count += 1
+                        
+                        await status_msg.edit_text(
+                            f"✅ **Completed {i}/{len(urls)}**\n"
+                            f"🎬 **{video_info['title'][:50]}...**"
                         )
-                    success_count += 1
+                        
+                    except Exception as e:
+                        await status_msg.edit_text(
+                            f"⚠️ **Downloaded but upload failed {i}/{len(urls)}**\n"
+                            f"🎬 **{video_info['title'][:50]}...**\n"
+                            f"Error: {str(e)[:100]}"
+                        )
+                        failed_count += 1
+                        failed_videos.append(f"{video_info['title']} - Upload failed")
                     
                     # Cleanup
                     Path(download_result['filepath']).unlink(missing_ok=True)
                 else:
+                    await status_msg.edit_text(
+                        f"❌ **Failed {i}/{len(urls)}**\n"
+                        f"🎬 **{video_info['title'][:50]}...**\n"
+                        f"Error: {download_result.get('error', 'Unknown')[:100]}"
+                    )
                     failed_count += 1
-                    
-                await status_msg.delete()
+                    failed_videos.append(f"{video_info['title']} - {download_result.get('error', 'Unknown')}")
+                
+                # Delay between downloads
+                await asyncio.sleep(3)
                 
             except Exception as e:
                 logger.error(f"Error in bulk download item {i}: {e}")
                 failed_count += 1
+                failed_videos.append(f"URL {i} - {str(e)[:100]}")
                 
-            # Delay between downloads
-            await asyncio.sleep(2)
+                if 'status_msg' in locals():
+                    await status_msg.edit_text(
+                        f"❌ **Error {i}/{len(urls)}**\n"
+                        f"Exception: {str(e)[:100]}"
+                    )
         
         # Final report
-        await query.message.reply_text(
+        report = (
             f"✅ **Bulk Download Complete!**\n\n"
             f"📊 **Results:**\n"
             f"✅ Successful: {success_count}\n"
             f"❌ Failed: {failed_count}\n"
-            f"📁 Total: {len(urls)}"
+            f"📁 Total: {len(urls)}\n"
         )
+        
+        if failed_videos and len(failed_videos) <= 10:
+            report += "\n❌ **Failed videos:**\n"
+            for failed in failed_videos[:10]:
+                report += f"• {failed[:80]}...\n"
+        elif failed_videos:
+            report += f"\n❌ **Failed videos:** {len(failed_videos)} (too many to list)\n"
+        
+        await query.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
         
         # Cleanup user state
         if user_id in user_states:
@@ -481,19 +750,28 @@ class YouTubeDownloadBot:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show bot status."""
+        user_id = update.effective_user.id
+        
+        # Get cookies status
+        cookie_status = self.cookie_manager.get_cookies_status(user_id)
+        
+        # Get disk space info
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage("/")
+            disk_info = f"{free // (2**30)}GB free"
+        except:
+            disk_info = "Unknown"
+        
         status = (
             "🤖 **Bot Status**\n\n"
             "✅ **Operational**\n"
-            "📊 **Active Users:** {}\n"
-            "💾 **Storage:** Ready\n"
-            "🍪 **Cookies:** {}\n"
-            "⚡ **Version:** 2.0.0\n\n"
-            "🔄 **Last Update:** {}\n"
-            "🏠 **Host:** Render"
-        ).format(
-            len(user_states),
-            "✅ Configured" if self.cookie_manager.has_cookies() else "❌ Not configured",
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f"👤 **Your ID:** {user_id}\n"
+            f"🍪 **Cookies:** {cookie_status['message']}\n"
+            f"💾 **Storage:** {disk_info}\n"
+            f"⚡ **Version:** 2.1.0\n\n"
+            f"🔄 **Last Update:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"🏠 **Host:** Render"
         )
         await update.message.reply_text(status, parse_mode=ParseMode.MARKDOWN)
 
@@ -502,9 +780,15 @@ class YouTubeDownloadBot:
         logger.error(f"Update {update} caused error {context.error}")
         
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ An error occurred. Please try again or contact support."
-            )
+            try:
+                error_msg = str(context.error)[:200]
+                await update.effective_message.reply_text(
+                    f"❌ An error occurred:\n`{error_msg}`\n\n"
+                    "Please try again or contact support.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except:
+                pass
 
 def main():
     """Start the bot."""
@@ -516,28 +800,24 @@ def main():
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Add command handlers
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help_command))
     application.add_handler(CommandHandler("update_cookies", bot.update_cookies))
+    application.add_handler(CommandHandler("cookies_help", bot.cookies_help))
     application.add_handler(CommandHandler("status", bot.status_command))
+    application.add_handler(CommandHandler("cancel", bot.cancel))
     
-    # Handle cookies file
+    # Handle documents (both cookies and bulk files)
     application.add_handler(MessageHandler(
         filters.Document.ALL & filters.ChatType.PRIVATE,
-        bot.handle_cookies_file
+        bot.handle_document
     ))
     
     # Handle YouTube URLs
     application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
         bot.handle_text_message
-    ))
-    
-    # Handle bulk files
-    application.add_handler(MessageHandler(
-        filters.Document.FileExtension("txt") & filters.ChatType.PRIVATE,
-        bot.handle_bulk_file
     ))
     
     # Handle inline keyboard buttons
@@ -548,6 +828,9 @@ def main():
     
     # Start the bot
     print("🤖 Bot is starting...")
+    print(f"📁 Temp directory: {TEMP_DIR}")
+    print(f"🍪 Cookies directory: {COOKIES_DIR}")
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
