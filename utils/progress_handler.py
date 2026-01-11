@@ -1,12 +1,18 @@
 import asyncio
 from typing import Dict, Any
 from telegram import Message
-import emoji
 
 class ProgressHandler:
     def __init__(self):
         self.emoji_cycle = ['🔄', '⚡', '📥', '🚀', '💾', '🌀']
         self.emoji_index = 0
+    
+    def _escape_markdown(self, text: str) -> str:
+        """Escape special characters for MarkdownV2."""
+        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        for char in special_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
     
     async def update_download_progress(self, message: Message, title: str, progress_data: Dict[str, Any]):
         """Update download progress message."""
@@ -30,18 +36,21 @@ class ProgressHandler:
             else:
                 speed_str = "Calculating..."
             
+            # Escape title for Markdown
+            safe_title = self._escape_markdown(title[:40])
+            
             # Create status message
             status_text = (
-                f"{emoji_char} **Downloading:** {title[:40]}...\n\n"
-                f"{progress_bar} **{percentage:.1f}%**\n\n"
-                f"📊 **Progress:** {progress_data.get('downloaded_mb', 0):.1f} MB / "
+                f"{emoji_char} *Downloading:* {safe_title}\\.\\.\\.\n\n"
+                f"{progress_bar} *{percentage:.1f}%*\n\n"
+                f"📊 *Progress:* {progress_data.get('downloaded_mb', 0):.1f} MB / "
                 f"{progress_data.get('total_mb', 0):.1f} MB\n"
-                f"⚡ **Speed:** {speed_str}\n"
-                f"⏱️ **ETA:** {eta_str}\n"
-                f"📁 **Status:** Downloading..."
+                f"⚡ *Speed:* {speed_str}\n"
+                f"⏱️ *ETA:* {eta_str}\n"
+                f"📁 *Status:* Downloading\\.\\.\\."
             )
             
-            await message.edit_text(status_text, parse_mode="Markdown")
+            await message.edit_text(status_text, parse_mode="MarkdownV2")
             
         except Exception as e:
             # Don't crash if message edit fails
@@ -87,13 +96,13 @@ class ProgressHandler:
             progress_bar = self._create_progress_bar(percentage)
             
             status_text = (
-                f"📤 **Uploading to Telegram**\n\n"
-                f"{progress_bar} **{percentage:.1f}%**\n\n"
-                f"📊 **Progress:** {current/(1024*1024):.1f} MB / {total/(1024*1024):.1f} MB\n"
-                f"⏱️ **Status:** Uploading..."
+                f"📤 *Uploading to Telegram*\n\n"
+                f"{progress_bar} *{percentage:.1f}%*\n\n"
+                f"📊 *Progress:* {current/(1024*1024):.1f} MB / {total/(1024*1024):.1f} MB\n"
+                f"⏱️ *Status:* Uploading\\.\\.\\."
             )
             
-            await message.edit_text(status_text, parse_mode="Markdown")
+            await message.edit_text(status_text, parse_mode="MarkdownV2")
             
         except Exception:
             pass
