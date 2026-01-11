@@ -994,7 +994,6 @@ def main():
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
-            poll_timeout=30,
             close_loop=False
         )
     except KeyboardInterrupt:
