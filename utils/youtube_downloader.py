@@ -29,7 +29,7 @@ class YouTubeDownloader:
         
         # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 5  # Minimum 5 seconds between requests
+        self.min_request_interval = 1  # Reduced from 5 to 1 second
         
     def is_youtube_url(self, url: str) -> bool:
         """Check if the URL is a valid YouTube URL."""
@@ -52,14 +52,16 @@ class YouTubeDownloader:
         
         if time_since_last < self.min_request_interval:
             sleep_time = self.min_request_interval - time_since_last
-            logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
-            time.sleep(sleep_time)
+            if sleep_time > 0.1:  # Only sleep if more than 100ms
+                logger.debug(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
         
         self.last_request_time = time.time()
     
     def _get_ydl_opts(self, user_id: int, extract_flat: bool = False) -> Dict:
         """Get YouTube DL options with enhanced configuration."""
-        self._rate_limit()  # Apply rate limiting
+        # Move rate limiting to only when actually making requests, not when getting options
+        # self._rate_limit()  # REMOVED - called only when actually downloading
         
         cookies_path = self.cookie_manager.get_cookies_path(user_id)
         
@@ -87,16 +89,16 @@ class YouTubeDownloader:
                 'Referer': 'https://www.youtube.com/',
             },
             
-            # Retry configuration
-            'retries': 5,
-            'fragment_retries': 5,
+            # Retry configuration - reduced for faster response
+            'retries': 3,
+            'fragment_retries': 3,
             'skip_unavailable_fragments': True,
             'continuedl': True,
             
-            # Throttling
-            'sleep_interval': 5,
-            'max_sleep_interval': 10,
-            'sleep_interval_requests': 3,
+            # Throttling - reduced for faster downloads
+            'sleep_interval': 2,
+            'max_sleep_interval': 5,
+            'sleep_interval_requests': 2,
             
             # Signature extraction fixes
             'extractor_args': {
@@ -115,6 +117,11 @@ class YouTubeDownloader:
             
             # Verbose for debugging
             'verbose': False,
+            
+            # Timeouts - reduced to avoid hanging
+            'socket_timeout': 15,
+            'extract_timeout': 30,
+            'download_timeout': 60,
         }
         
         # Add cookies if available
@@ -138,55 +145,42 @@ class YouTubeDownloader:
         opts['extractor_retries'] = 2
         opts['ignore_no_formats_error'] = True
         
+        # Add progress updates more frequently
+        opts['progress_hooks'] = [self._create_dummy_progress_hook()]  # Dummy hook to avoid None
+        
         return opts
+    
+    def _create_dummy_progress_hook(self):
+        """Create a dummy progress hook to avoid None in ydl_opts."""
+        def hook(d):
+            pass
+        return hook
     
     async def get_video_info(self, url: str, user_id: int) -> Optional[Dict]:
         """Get video information including available formats."""
         loop = asyncio.get_event_loop()
         
         try:
+            # Apply rate limiting before making request
+            self._rate_limit()
+            
             ydl_opts = self._get_ydl_opts(user_id, extract_flat=False)
             
-            # Try multiple times with different options if needed
-            max_attempts = 2
-            for attempt in range(max_attempts):
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = await loop.run_in_executor(
-                            None, 
-                            lambda: ydl.extract_info(url, download=False)
-                        )
-                        
-                        if info:
-                            break
-                        else:
-                            logger.warning(f"Attempt {attempt + 1}: No info returned")
-                            await asyncio.sleep(2)
-                            
-                except yt_dlp.utils.DownloadError as e:
-                    if "429" in str(e) or "Too Many Requests" in str(e):
-                        logger.error(f"Rate limited on attempt {attempt + 1}")
-                        # Wait longer if rate limited
-                        await asyncio.sleep(10)
-                        continue
-                    elif "400" in str(e) or "Bad Request" in str(e):
-                        logger.error(f"Bad request on attempt {attempt + 1}, trying different options")
-                        # Try with different extractor options
-                        ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android_embedded']
-                        await asyncio.sleep(5)
-                        continue
-                    else:
-                        logger.error(f"DownloadError on attempt {attempt + 1}: {e}")
-                        await asyncio.sleep(3)
-                        continue
-                
-                except Exception as e:
-                    logger.error(f"Error on attempt {attempt + 1}: {e}")
-                    await asyncio.sleep(3)
-                    continue
+            # Set timeout for the operation
+            try:
+                info = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: self._extract_info_with_retry(url, ydl_opts)
+                    ),
+                    timeout=45  # 45 second timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout getting video info for {url}")
+                return None
             
             if not info:
-                logger.error(f"Failed to get video info after {max_attempts} attempts")
+                logger.error(f"Failed to get video info for {url}")
                 return None
             
             # Get available video formats
@@ -266,44 +260,52 @@ class YouTubeDownloader:
                 
         except Exception as e:
             logger.error(f"Error getting video info for {url}: {e}")
-            # Try one more time with simpler options
-            try:
-                logger.info("Trying with simpler options...")
-                simple_opts = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'format': 'best',
-                    'user_agent': random.choice(self.user_agents),
-                }
-                
-                with yt_dlp.YoutubeDL(simple_opts) as ydl:
-                    info = await loop.run_in_executor(
-                        None,
-                        lambda: ydl.extract_info(url, download=False)
-                    )
-                    
-                    if info:
-                        # Return minimal info
-                        return {
-                            'title': info.get('title', 'Unknown Title'),
-                            'duration': info.get('duration', 0),
-                            'duration_string': self._format_duration(info.get('duration', 0)),
-                            'thumbnail': info.get('thumbnail'),
-                            'formats': [{
-                                'format_id': 'best',
-                                'resolution': 'Best Available',
-                                'ext': 'mp4',
-                            }],
-                        }
-            except:
-                pass
-            
             return None
+    
+    def _extract_info_with_retry(self, url: str, ydl_opts: Dict, max_attempts: int = 2):
+        """Extract info with retry logic."""
+        for attempt in range(max_attempts):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info:
+                        return info
+                    else:
+                        logger.warning(f"Attempt {attempt + 1}: No info returned")
+                        time.sleep(2)
+                        
+            except yt_dlp.utils.DownloadError as e:
+                error_str = str(e)
+                if "429" in error_str or "Too Many Requests" in error_str:
+                    logger.error(f"Rate limited on attempt {attempt + 1}")
+                    # Wait longer if rate limited
+                    time.sleep(10)
+                    continue
+                elif "400" in error_str or "Bad Request" in error_str:
+                    logger.error(f"Bad request on attempt {attempt + 1}, trying different options")
+                    # Try with different extractor options
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android_embedded']
+                    time.sleep(5)
+                    continue
+                else:
+                    logger.error(f"DownloadError on attempt {attempt + 1}: {e}")
+                    time.sleep(3)
+                    continue
+            
+            except Exception as e:
+                logger.error(f"Error on attempt {attempt + 1}: {e}")
+                time.sleep(3)
+                continue
+        
+        return None
     
     async def download_video(self, url: str, format_id: str, user_id: int, 
                            progress_callback: Optional[Callable] = None) -> Dict:
         """Download video with specified format."""
         loop = asyncio.get_event_loop()
+        
+        # Apply rate limiting before making request
+        self._rate_limit()
         
         # Create output template
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -345,10 +347,7 @@ class YouTubeDownloader:
                     
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         logger.info(f"Trying format: {format_string}")
-                        info = await loop.run_in_executor(
-                            None,
-                            lambda: ydl.extract_info(url, download=True)
-                        )
+                        info = ydl.extract_info(url, download=True)
                         
                         if info:
                             # Get downloaded file
@@ -383,7 +382,7 @@ class YouTubeDownloader:
                 
                 except Exception as e:
                     logger.warning(f"Format {format_string} failed: {e}")
-                    await asyncio.sleep(3)
+                    time.sleep(3)
                     continue
             
             if download_result:
@@ -416,10 +415,7 @@ class YouTubeDownloader:
                     ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = await loop.run_in_executor(
-                        None,
-                        lambda: ydl.extract_info(url, download=True)
-                    )
+                    info = ydl.extract_info(url, download=True)
                     
                     if info:
                         # Get downloaded file
