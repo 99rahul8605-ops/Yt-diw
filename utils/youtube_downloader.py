@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 import yt_dlp
 from datetime import datetime
+import aiohttp
+import logging
+
+logger = logging.getLogger(__name__)
 
 class YouTubeDownloader:
     def __init__(self, cookie_manager):
@@ -23,6 +27,10 @@ class YouTubeDownloader:
             'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
         ]
         
+        # Rate limiting
+        self.last_request_time = 0
+        self.min_request_interval = 5  # Minimum 5 seconds between requests
+        
     def is_youtube_url(self, url: str) -> bool:
         """Check if the URL is a valid YouTube URL."""
         patterns = [
@@ -31,12 +39,28 @@ class YouTubeDownloader:
             r'^https?://www\.youtube\.com/shorts/[a-zA-Z0-9_-]+',
             r'^https?://www\.youtube\.com/embed/[a-zA-Z0-9_-]+',
             r'^https?://www\.youtube\.com/live/[a-zA-Z0-9_-]+',
+            r'^https?://www\.youtube\.com/watch\?v=[a-zA-Z0-9_-]+',
+            r'^https?://www\.youtube\.com/playlist\?list=[a-zA-Z0-9_-]+',
         ]
         
         return any(re.match(pattern, url, re.IGNORECASE) for pattern in patterns)
     
+    def _rate_limit(self):
+        """Implement rate limiting to avoid 429 errors."""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        if time_since_last < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last
+            logger.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
+    
     def _get_ydl_opts(self, user_id: int, extract_flat: bool = False) -> Dict:
         """Get YouTube DL options with enhanced configuration."""
+        self._rate_limit()  # Apply rate limiting
+        
         cookies_path = self.cookie_manager.get_cookies_path(user_id)
         
         opts = {
@@ -46,10 +70,10 @@ class YouTubeDownloader:
             'no_color': True,
             'extract_flat': extract_flat,
             
-            # Enhanced headers
+            # Enhanced headers to avoid detection
             'http_headers': {
                 'User-Agent': random.choice(self.user_agents),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate',
                 'DNT': '1',
@@ -58,30 +82,61 @@ class YouTubeDownloader:
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
                 'Cache-Control': 'max-age=0',
+                'Referer': 'https://www.youtube.com/',
             },
             
             # Retry configuration
-            'retries': 15,
-            'fragment_retries': 10,
+            'retries': 5,
+            'fragment_retries': 5,
             'skip_unavailable_fragments': True,
             'continuedl': True,
             
             # Throttling
-            'sleep_interval': 2,
-            'max_sleep_interval': 8,
-            'sleep_interval_requests': 2,
+            'sleep_interval': 5,
+            'max_sleep_interval': 10,
+            'sleep_interval_requests': 3,
             
-            # Proxy (optional, uncomment if needed)
-            # 'proxy': 'http://proxy:port',
+            # Signature extraction fixes
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                    'player_skip': ['configs', 'webpage'],
+                }
+            },
+            
+            # Avoid problematic formats
+            'format_sort': ['res', 'fps', 'vcodec:avc1'],
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            
+            # Cache
+            'cachedir': False,  # Disable cache to avoid issues
+            
+            # Verbose for debugging
+            'verbose': False,
         }
         
         # Add cookies if available
         if cookies_path and cookies_path.exists():
             opts['cookiefile'] = str(cookies_path)
-            print(f"✅ Using cookies from: {cookies_path}")
+            logger.info(f"Using cookies from: {cookies_path}")
         else:
-            print("⚠️ No cookies found, some videos may not work")
+            logger.warning("No cookies found, some videos may not work")
+        
+        # Add geobypass for region-restricted content
+        opts['geo_bypass'] = True
+        opts['geo_bypass_country'] = 'US'
+        
+        # For age-restricted content
+        opts['age_limit'] = 0
+        
+        # Add proxy support (optional)
+        # opts['proxy'] = 'http://proxy:port'
+        
+        # Disable some extractors that cause issues
+        opts['extractor_retries'] = 2
+        opts['ignore_no_formats_error'] = True
         
         return opts
     
@@ -92,11 +147,11 @@ class YouTubeDownloader:
         try:
             ydl_opts = self._get_ydl_opts(user_id, extract_flat=False)
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract info with retry logic
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
+            # Try multiple times with different options if needed
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = await loop.run_in_executor(
                             None, 
                             lambda: ydl.extract_info(url, download=False)
@@ -104,86 +159,145 @@ class YouTubeDownloader:
                         
                         if info:
                             break
-                    except yt_dlp.utils.DownloadError as e:
-                        if attempt == max_retries - 1:
-                            print(f"Failed to get info after {max_retries} attempts: {e}")
-                            return None
-                        print(f"Attempt {attempt + 1} failed, retrying...")
-                        await asyncio.sleep(2)
+                        else:
+                            logger.warning(f"Attempt {attempt + 1}: No info returned")
+                            await asyncio.sleep(2)
+                            
+                except yt_dlp.utils.DownloadError as e:
+                    if "429" in str(e) or "Too Many Requests" in str(e):
+                        logger.error(f"Rate limited on attempt {attempt + 1}")
+                        # Wait longer if rate limited
+                        await asyncio.sleep(10)
+                        continue
+                    elif "400" in str(e) or "Bad Request" in str(e):
+                        logger.error(f"Bad request on attempt {attempt + 1}, trying different options")
+                        # Try with different extractor options
+                        ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android_embedded']
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        logger.error(f"DownloadError on attempt {attempt + 1}: {e}")
+                        await asyncio.sleep(3)
+                        continue
                 
-                if not info:
-                    print(f"No info returned for {url}")
-                    return None
-                
-                # Get available video formats
-                formats = []
-                seen_formats = set()
-                
-                for f in info.get('formats', []):
-                    if f.get('vcodec') != 'none':  # Has video
-                        # Create format identifier
-                        resolution = f"{f.get('height', 'N/A')}p"
-                        fps = f.get('fps')
-                        if fps:
-                            resolution += f"@{int(fps)}fps"
-                        
-                        # Check if audio is included
-                        has_audio = f.get('acodec') != 'none'
-                        audio_note = " + Audio" if has_audio else " (Video only)"
-                        
-                        format_id = f['format_id']
-                        if format_id in seen_formats:
-                            continue
-                        
-                        seen_formats.add(format_id)
-                        
-                        format_info = {
-                            'format_id': format_id,
-                            'resolution': resolution,
-                            'resolution_display': f"{resolution}{audio_note}",
-                            'ext': f.get('ext', 'mp4'),
-                            'filesize': f.get('filesize'),
-                            'vcodec': f.get('vcodec', 'unknown'),
-                            'acodec': f.get('acodec', 'none'),
-                            'has_audio': has_audio,
-                        }
-                        
-                        formats.append(format_info)
-                
-                # Sort by resolution
-                def get_height(format_info):
-                    res = format_info['resolution'].split('p')[0]
-                    return int(res) if res.isdigit() else 0
-                
-                formats.sort(key=get_height, reverse=True)
-                
-                # Get best thumbnail
-                thumbnail = info.get('thumbnail')
-                if not thumbnail:
-                    thumbnails = info.get('thumbnails', [])
-                    if thumbnails:
-                        # Get highest resolution thumbnail
-                        thumbnails.sort(key=lambda x: x.get('height', 0), reverse=True)
-                        thumbnail = thumbnails[0].get('url')
-                
-                return {
-                    'title': info.get('title', 'Unknown Title'),
-                    'duration': info.get('duration', 0),
-                    'duration_string': self._format_duration(info.get('duration', 0)),
-                    'view_count': info.get('view_count', 0),
-                    'like_count': info.get('like_count', 0),
-                    'upload_date': self._format_date(info.get('upload_date', '')),
-                    'thumbnail': thumbnail,
-                    'channel': info.get('channel', 'Unknown Channel'),
-                    'description': info.get('description', '')[:200] + '...',
-                    'formats': formats[:12],  # Limit to 12 formats
-                    'webpage_url': info.get('webpage_url', url),
-                    'age_limit': info.get('age_limit', 0),
-                    'is_live': info.get('is_live', False),
-                }
+                except Exception as e:
+                    logger.error(f"Error on attempt {attempt + 1}: {e}")
+                    await asyncio.sleep(3)
+                    continue
+            
+            if not info:
+                logger.error(f"Failed to get video info after {max_attempts} attempts")
+                return None
+            
+            # Get available video formats
+            formats = []
+            seen_formats = set()
+            
+            for f in info.get('formats', []):
+                if f.get('vcodec') != 'none':  # Has video
+                    # Create format identifier
+                    height = f.get('height', 0)
+                    if height:
+                        resolution = f"{height}p"
+                    else:
+                        resolution = "unknown"
+                    
+                    fps = f.get('fps')
+                    if fps:
+                        resolution += f"@{int(fps)}fps"
+                    
+                    # Check if audio is included
+                    has_audio = f.get('acodec') != 'none'
+                    
+                    format_id = f.get('format_id', 'unknown')
+                    if format_id in seen_formats:
+                        continue
+                    
+                    seen_formats.add(format_id)
+                    
+                    format_info = {
+                        'format_id': format_id,
+                        'resolution': resolution,
+                        'resolution_display': f"{resolution}{' + Audio' if has_audio else ' (Video only)'}",
+                        'ext': f.get('ext', 'mp4'),
+                        'filesize': f.get('filesize'),
+                        'vcodec': f.get('vcodec', 'unknown'),
+                        'acodec': f.get('acodec', 'none'),
+                        'has_audio': has_audio,
+                    }
+                    
+                    formats.append(format_info)
+            
+            # Sort by resolution
+            def get_height(format_info):
+                res = format_info['resolution'].split('p')[0]
+                try:
+                    return int(res)
+                except:
+                    return 0
+            
+            formats.sort(key=get_height, reverse=True)
+            
+            # Get best thumbnail
+            thumbnail = info.get('thumbnail')
+            if not thumbnail:
+                thumbnails = info.get('thumbnails', [])
+                if thumbnails:
+                    # Get highest resolution thumbnail
+                    thumbnails.sort(key=lambda x: x.get('height', 0), reverse=True)
+                    thumbnail = thumbnails[0].get('url')
+            
+            return {
+                'title': info.get('title', 'Unknown Title'),
+                'duration': info.get('duration', 0),
+                'duration_string': self._format_duration(info.get('duration', 0)),
+                'view_count': info.get('view_count', 0),
+                'like_count': info.get('like_count', 0),
+                'upload_date': self._format_date(info.get('upload_date', '')),
+                'thumbnail': thumbnail,
+                'channel': info.get('channel', 'Unknown Channel'),
+                'description': info.get('description', '')[:200] + '...',
+                'formats': formats[:8],  # Limit to 8 formats
+                'webpage_url': info.get('webpage_url', url),
+                'age_limit': info.get('age_limit', 0),
+                'is_live': info.get('is_live', False),
+                'video_id': info.get('id', ''),
+            }
                 
         except Exception as e:
-            print(f"Error getting video info for {url}: {e}")
+            logger.error(f"Error getting video info for {url}: {e}")
+            # Try one more time with simpler options
+            try:
+                logger.info("Trying with simpler options...")
+                simple_opts = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    'format': 'best',
+                    'user_agent': random.choice(self.user_agents),
+                }
+                
+                with yt_dlp.YoutubeDL(simple_opts) as ydl:
+                    info = await loop.run_in_executor(
+                        None,
+                        lambda: ydl.extract_info(url, download=False)
+                    )
+                    
+                    if info:
+                        # Return minimal info
+                        return {
+                            'title': info.get('title', 'Unknown Title'),
+                            'duration': info.get('duration', 0),
+                            'duration_string': self._format_duration(info.get('duration', 0)),
+                            'thumbnail': info.get('thumbnail'),
+                            'formats': [{
+                                'format_id': 'best',
+                                'resolution': 'Best Available',
+                                'ext': 'mp4',
+                            }],
+                        }
+            except:
+                pass
+            
             return None
     
     async def download_video(self, url: str, format_id: str, user_id: int, 
@@ -200,118 +314,196 @@ class YouTubeDownloader:
         
         # Handle format selection
         if format_id == 'best':
-            ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        else:
-            # Try to find a format with video+audio for the given format_id
-            ydl_opts['format'] = f'{format_id}+bestaudio/best'
-        
-        # Add download-specific options
-        ydl_opts.update({
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-            'concurrent_fragment_downloads': 3,
-            'buffersize': 1024 * 1024 * 16,  # 16MB buffer
-            'http_chunk_size': 10485760,  # 10MB chunks
-        })
-        
-        # Add progress hook
-        if progress_callback:
-            ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                print(f"Starting download with format: {format_id}")
-                
-                info = await loop.run_in_executor(
-                    None,
-                    lambda: ydl.extract_info(url, download=True)
-                )
-                
-                if not info:
-                    return {
-                        'success': False,
-                        'error': 'Failed to extract video info'
-                    }
-                
-                # Get downloaded file path
-                downloaded_file = ydl.prepare_filename(info)
-                
-                # Try to find the actual file
-                file_path = None
-                possible_extensions = ['.mp4', '.mkv', '.webm', '.m4a', '.mp3']
-                
-                for ext in possible_extensions:
-                    # Try with extension from info
-                    base_name = downloaded_file.rsplit('.', 1)[0]
-                    test_path = f"{base_name}{ext}"
-                    if Path(test_path).exists():
-                        file_path = test_path
-                        break
-                
-                # If still not found, check for files with similar names
-                if not file_path:
-                    for file in self.temp_dir.glob(f"{timestamp}_*"):
-                        if file.is_file():
-                            file_path = str(file)
-                            break
-                
-                if file_path and Path(file_path).exists():
-                    file_size = Path(file_path).stat().st_size
+            # Try multiple format combinations
+            format_strings = [
+                'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'bestvideo+bestaudio/best',
+                'best',
+                '22/18',  # Fallback to common formats
+            ]
+            
+            # Try each format string until one works
+            download_result = None
+            for format_string in format_strings:
+                try:
+                    ydl_opts['format'] = format_string
+                    ydl_opts.update({
+                        'outtmpl': output_template,
+                        'merge_output_format': 'mp4',
+                        'postprocessors': [{
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',
+                        }],
+                        'concurrent_fragment_downloads': 2,  # Reduced for stability
+                        'buffersize': 1024 * 1024 * 8,  # 8MB buffer
+                        'http_chunk_size': 4194304,  # 4MB chunks
+                    })
                     
-                    # Check file size limit
-                    if file_size > 2000 * 1024 * 1024:  # 2GB
+                    # Add progress hook
+                    if progress_callback:
+                        ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
+                    
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        logger.info(f"Trying format: {format_string}")
+                        info = await loop.run_in_executor(
+                            None,
+                            lambda: ydl.extract_info(url, download=True)
+                        )
+                        
+                        if info:
+                            # Get downloaded file
+                            downloaded_file = ydl.prepare_filename(info)
+                            file_path = self._find_downloaded_file(downloaded_file, info)
+                            
+                            if file_path:
+                                file_size = Path(file_path).stat().st_size
+                                
+                                # Check file size limit
+                                if file_size > 2000 * 1024 * 1024:  # 2GB
+                                    return {
+                                        'success': False,
+                                        'error': f'File too large ({file_size/(1024*1024):.1f}MB). Telegram limit is 2GB.'
+                                    }
+                                
+                                download_result = {
+                                    'success': True,
+                                    'filepath': file_path,
+                                    'filename': f"{info['title'][:100]}.mp4",
+                                    'title': info['title'],
+                                    'resolution': 'best',
+                                    'resolution_display': 'Best Available',
+                                    'file_size': file_size,
+                                    'file_size_mb': file_size / (1024 * 1024),
+                                    'duration': info.get('duration', 0),
+                                    'width': info.get('width', 1280),
+                                    'height': info.get('height', 720),
+                                    'has_audio': info.get('acodec') != 'none',
+                                }
+                                break
+                
+                except Exception as e:
+                    logger.warning(f"Format {format_string} failed: {e}")
+                    await asyncio.sleep(3)
+                    continue
+            
+            if download_result:
+                return download_result
+            else:
+                return {
+                    'success': False,
+                    'error': 'All format attempts failed'
+                }
+        
+        else:
+            # Specific format requested
+            try:
+                # Try with the specific format
+                ydl_opts['format'] = f'{format_id}+bestaudio/best'
+                ydl_opts.update({
+                    'outtmpl': output_template,
+                    'merge_output_format': 'mp4',
+                    'postprocessors': [{
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': 'mp4',
+                    }],
+                    'concurrent_fragment_downloads': 2,
+                    'buffersize': 1024 * 1024 * 8,
+                    'http_chunk_size': 4194304,
+                })
+                
+                # Add progress hook
+                if progress_callback:
+                    ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = await loop.run_in_executor(
+                        None,
+                        lambda: ydl.extract_info(url, download=True)
+                    )
+                    
+                    if info:
+                        # Get downloaded file
+                        downloaded_file = ydl.prepare_filename(info)
+                        file_path = self._find_downloaded_file(downloaded_file, info)
+                        
+                        if file_path:
+                            file_size = Path(file_path).stat().st_size
+                            
+                            # Check file size limit
+                            if file_size > 2000 * 1024 * 1024:  # 2GB
+                                return {
+                                    'success': False,
+                                    'error': f'File too large ({file_size/(1024*1024):.1f}MB). Telegram limit is 2GB.'
+                                }
+                            
+                            return {
+                                'success': True,
+                                'filepath': file_path,
+                                'filename': f"{info['title'][:100]}.mp4",
+                                'title': info['title'],
+                                'resolution': format_id,
+                                'resolution_display': f'{format_id}',
+                                'file_size': file_size,
+                                'file_size_mb': file_size / (1024 * 1024),
+                                'duration': info.get('duration', 0),
+                                'width': info.get('width', 1280),
+                                'height': info.get('height', 720),
+                                'has_audio': info.get('acodec') != 'none',
+                            }
+                        else:
+                            return {
+                                'success': False,
+                                'error': 'Downloaded file not found'
+                            }
+                    else:
                         return {
                             'success': False,
-                            'error': f'File too large ({file_size/(1024*1024):.1f}MB). Telegram limit is 2GB.'
+                            'error': 'Failed to extract video info'
                         }
-                    
-                    # Get resolution info
-                    resolution_display = "Best Available" if format_id == 'best' else f"{format_id}"
-                    if 'height' in info:
-                        resolution_display = f"{info['height']}p"
-                    
-                    return {
-                        'success': True,
-                        'filepath': file_path,
-                        'filename': f"{info['title'][:100]}.mp4",
-                        'title': info['title'],
-                        'resolution': format_id,
-                        'resolution_display': resolution_display,
-                        'file_size': file_size,
-                        'file_size_mb': file_size / (1024 * 1024),
-                        'duration': info.get('duration', 0),
-                        'width': info.get('width', 1280),
-                        'height': info.get('height', 720),
-                        'has_audio': info.get('acodec') != 'none',
-                    }
-                else:
-                    return {
-                        'success': False,
-                        'error': 'Downloaded file not found'
-                    }
-                    
-        except yt_dlp.utils.DownloadError as e:
-            print(f"DownloadError: {e}")
-            
-            # Try with simpler format if specific format failed
-            if format_id != '18' and format_id != 'best':
-                print(f"Trying fallback format 18 (360p)")
-                return await self.download_video(url, '18', user_id, progress_callback)
-            
-            return {
-                'success': False,
-                'error': f'Download error: {str(e)[:200]}'
-            }
-        except Exception as e:
-            print(f"Unexpected error in download_video: {e}")
-            return {
-                'success': False,
-                'error': str(e)[:200]
-            }
+                        
+            except yt_dlp.utils.DownloadError as e:
+                logger.error(f"DownloadError for format {format_id}: {e}")
+                
+                # Try fallback format
+                if format_id != '18':  # If not already trying 360p
+                    logger.info(f"Trying fallback format 18 (360p)")
+                    return await self.download_video(url, '18', user_id, progress_callback)
+                
+                return {
+                    'success': False,
+                    'error': f'Download error: {str(e)[:200]}'
+                }
+            except Exception as e:
+                logger.error(f"Unexpected error in download_video: {e}")
+                return {
+                    'success': False,
+                    'error': str(e)[:200]
+                }
+    
+    def _find_downloaded_file(self, base_filename: str, info: Dict) -> Optional[str]:
+        """Find the actual downloaded file with various extensions."""
+        # Try with extension from info
+        possible_extensions = ['.mp4', '.mkv', '.webm', '.m4a', '.mp3', '.flv', '.3gp']
+        
+        # First try the prepared filename
+        if Path(base_filename).exists():
+            return base_filename
+        
+        # Try without extension then add common extensions
+        base_name = base_filename.rsplit('.', 1)[0] if '.' in base_filename else base_filename
+        
+        for ext in possible_extensions:
+            test_path = f"{base_name}{ext}"
+            if Path(test_path).exists():
+                return test_path
+        
+        # Search for files with similar names
+        timestamp = datetime.now().strftime("%Y%m%d")
+        for file in self.temp_dir.glob(f"{timestamp}_*"):
+            if file.is_file() and file.stat().st_size > 0:
+                return str(file)
+        
+        return None
     
     def _create_progress_hook(self, progress_callback: Callable):
         """Create progress hook for yt-dlp."""
@@ -379,21 +571,13 @@ class YouTubeDownloader:
     
     async def verify_cookies(self, user_id: int) -> bool:
         """Verify if cookies are working."""
-        test_urls = [
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # Public video
-            "https://www.youtube.com/watch?v=jNQXAC9IVRw",  # First YouTube video
-        ]
+        test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # First YouTube video (less likely to be restricted)
         
-        for test_url in test_urls:
-            try:
-                info = await self.get_video_info(test_url, user_id)
-                if info:
-                    print(f"✅ Cookies working for: {test_url}")
-                    return True
-            except Exception as e:
-                print(f"Cookie test failed for {test_url}: {e}")
-        
-        return False
+        try:
+            info = await self.get_video_info(test_url, user_id)
+            return info is not None
+        except:
+            return False
     
     def cleanup_old_files(self, max_age_hours: int = 24):
         """Clean up old temporary files."""
@@ -404,6 +588,6 @@ class YouTubeDownloader:
                     file_age = current_time - file.stat().st_mtime
                     if file_age > max_age_hours * 3600:
                         file.unlink()
-                        print(f"Cleaned up old file: {file.name}")
+                        logger.info(f"Cleaned up old file: {file.name}")
         except Exception as e:
-            print(f"Error cleaning up files: {e}")
+            logger.error(f"Error cleaning up files: {e}")
