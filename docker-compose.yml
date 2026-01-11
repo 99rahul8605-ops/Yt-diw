@@ -6,14 +6,12 @@ services:
     container_name: youtube-downloader-bot
     restart: unless-stopped
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
     volumes:
-      - ./temp:/app/temp
-      - ./cookies:/app/cookies
+      - ./temp_downloads:/app/temp_downloads
       - ./logs:/app/logs
-    networks:
-      - bot-network
-
-networks:
-  bot-network:
-    driver: bridge
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
