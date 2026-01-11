@@ -41,6 +41,9 @@ class YouTubeDownloader:
             r'^https?://www\.youtube\.com/live/[a-zA-Z0-9_-]+',
             r'^https?://www\.youtube\.com/watch\?v=[a-zA-Z0-9_-]+',
             r'^https?://www\.youtube\.com/playlist\?list=[a-zA-Z0-9_-]+',
+            r'^https?://www\.youtube\.com/c/[a-zA-Z0-9_-]+',
+            r'^https?://www\.youtube\.com/user/[a-zA-Z0-9_-]+',
+            r'^https?://www\.youtube\.com/channel/[a-zA-Z0-9_-]+',
         ]
         
         return any(re.match(pattern, url, re.IGNORECASE) for pattern in patterns)
@@ -60,9 +63,6 @@ class YouTubeDownloader:
     
     def _get_ydl_opts(self, user_id: int, extract_flat: bool = False) -> Dict:
         """Get YouTube DL options with enhanced configuration."""
-        # Move rate limiting to only when actually making requests, not when getting options
-        # self._rate_limit()  # REMOVED - called only when actually downloading
-        
         cookies_path = self.cookie_manager.get_cookies_path(user_id)
         
         opts = {
@@ -476,6 +476,95 @@ class YouTubeDownloader:
                     'error': str(e)[:200]
                 }
     
+    async def download_audio(self, url: str, user_id: int, 
+                           progress_callback: Optional[Callable] = None) -> Dict:
+        """Download audio only in MP3 format."""
+        loop = asyncio.get_event_loop()
+        
+        # Apply rate limiting before making request
+        self._rate_limit()
+        
+        # Create output template
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_template = str(self.temp_dir / f"{timestamp}_%(title).100s.%(ext)s")
+        
+        # Get base options
+        ydl_opts = self._get_ydl_opts(user_id)
+        
+        try:
+            # Set options for audio download
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'outtmpl': output_template,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'keepvideo': False,
+                'concurrent_fragment_downloads': 2,
+                'buffersize': 1024 * 1024 * 8,
+                'http_chunk_size': 4194304,
+            })
+            
+            # Add progress hook
+            if progress_callback:
+                ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                
+                if info:
+                    # Get downloaded file
+                    downloaded_file = ydl.prepare_filename(info)
+                    file_path = self._find_audio_file(downloaded_file, info)
+                    
+                    if file_path:
+                        file_size = Path(file_path).stat().st_size
+                        
+                        # Check file size limit
+                        if file_size > 200 * 1024 * 1024:  # 200MB for audio
+                            return {
+                                'success': False,
+                                'error': f'Audio file too large ({file_size/(1024*1024):.1f}MB).'
+                            }
+                        
+                        return {
+                            'success': True,
+                            'filepath': file_path,
+                            'filename': f"{info['title'][:100]}.mp3",
+                            'title': info['title'],
+                            'resolution': 'audio',
+                            'resolution_display': 'MP3 Audio',
+                            'file_size': file_size,
+                            'file_size_mb': file_size / (1024 * 1024),
+                            'duration': info.get('duration', 0),
+                            'has_audio': True,
+                        }
+                    else:
+                        return {
+                            'success': False,
+                            'error': 'Downloaded audio file not found'
+                        }
+                else:
+                    return {
+                        'success': False,
+                        'error': 'Failed to extract audio info'
+                    }
+                    
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"DownloadError for audio: {e}")
+            return {
+                'success': False,
+                'error': f'Audio download error: {str(e)[:200]}'
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error in download_audio: {e}")
+            return {
+                'success': False,
+                'error': str(e)[:200]
+            }
+    
     def _find_downloaded_file(self, base_filename: str, info: Dict) -> Optional[str]:
         """Find the actual downloaded file with various extensions."""
         # Try with extension from info
@@ -498,6 +587,33 @@ class YouTubeDownloader:
         for file in self.temp_dir.glob(f"{timestamp}_*"):
             if file.is_file() and file.stat().st_size > 0:
                 return str(file)
+        
+        return None
+    
+    def _find_audio_file(self, base_filename: str, info: Dict) -> Optional[str]:
+        """Find the actual downloaded audio file."""
+        # First try MP3 version (post-processor changes extension)
+        base_name = base_filename.rsplit('.', 1)[0] if '.' in base_filename else base_filename
+        mp3_path = f"{base_name}.mp3"
+        
+        if Path(mp3_path).exists():
+            return mp3_path
+        
+        # Try other audio extensions
+        audio_extensions = ['.m4a', '.ogg', '.wav', '.opus', '.aac']
+        
+        for ext in audio_extensions:
+            test_path = f"{base_name}{ext}"
+            if Path(test_path).exists():
+                return test_path
+        
+        # Search for files with similar names
+        timestamp = datetime.now().strftime("%Y%m%d")
+        for file in self.temp_dir.glob(f"{timestamp}_*"):
+            if file.is_file() and file.stat().st_size > 0:
+                # Check if it's likely an audio file
+                if any(file.suffix.lower() == ext for ext in ['.mp3', '.m4a', '.ogg', '.wav', '.opus', '.aac']):
+                    return str(file)
         
         return None
     
@@ -537,6 +653,74 @@ class YouTubeDownloader:
                     pass
                     
         return hook
+    
+    async def extract_playlist(self, url: str, user_id: int) -> Dict:
+        """Extract playlist or video links to text content."""
+        loop = asyncio.get_event_loop()
+        
+        try:
+            # Apply rate limiting
+            self._rate_limit()
+            
+            # Configure for playlist extraction
+            ydl_opts = self._get_ydl_opts(user_id, extract_flat=True)
+            ydl_opts.update({
+                'quiet': True,
+                'extract_flat': True,
+                'force_generic_extractor': True,
+                'skip_download': True,
+            })
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await loop.run_in_executor(
+                    None,
+                    lambda: ydl.extract_info(url, download=False)
+                )
+                
+                if not info:
+                    return {
+                        'success': False,
+                        'error': 'Could not extract playlist information'
+                    }
+                
+                videos = []
+                title = info.get('title', 'YouTube Playlist')
+                
+                if 'entries' in info:
+                    # This is a playlist or channel
+                    for entry in info['entries']:
+                        if entry and entry.get('url'):
+                            video_title = entry.get('title', 'Unknown Title')
+                            video_url = entry.get('url')
+                            videos.append(f"{video_title}: {video_url}")
+                else:
+                    # Single video
+                    video_title = info.get('title', 'Unknown Title')
+                    video_url = info.get('webpage_url', url)
+                    videos.append(f"{video_title}: {video_url}")
+                
+                if not videos:
+                    return {
+                        'success': False,
+                        'error': 'No videos found in the playlist'
+                    }
+                
+                content = '\n'.join(videos)
+                
+                return {
+                    'success': True,
+                    'title': title,
+                    'count': len(videos),
+                    'content': content,
+                    'url': url
+                }
+                
+        except Exception as e:
+            logger.error(f"Error extracting playlist {url}: {e}")
+            return {
+                'success': False,
+                'error': str(e)[:200]
+            }
     
     def _format_duration(self, seconds: int) -> str:
         """Format duration in seconds to HH:MM:SS."""
