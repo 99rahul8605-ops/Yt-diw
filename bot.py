@@ -62,6 +62,7 @@ class YouTubeDownloadBot:
         self.cookie_manager = CookieManager(COOKIES_DIR)
         self.downloader = YouTubeDownloader(self.cookie_manager)
         self.progress_handler = ProgressHandler()
+        self.callback_timeout = 60  # Store callback data for 60 seconds
     
     async def download_with_retry(self, url: str, format_id: str, user_id: int, 
                                 progress_callback=None, max_retries: int = 3, initial_delay: int = 5) -> Dict:
@@ -439,7 +440,8 @@ class YouTubeDownloadBot:
                 'bulk_urls': valid_urls,
                 'current_index': 0,
                 'total_count': len(valid_urls),
-                'invalid_urls': invalid_urls
+                'invalid_urls': invalid_urls,
+                'timestamp': time.time()  # Add timestamp for timeout checking
             }
             
             await update.message.reply_text(
@@ -492,7 +494,8 @@ class YouTubeDownloadBot:
             user_states[user_id] = {
                 'video_url': text,
                 'video_info': video_info,
-                'status_message': status_msg
+                'status_message': status_msg,
+                'timestamp': time.time()  # Add timestamp for timeout checking
             }
             
             # Create resolution buttons
@@ -566,16 +569,44 @@ class YouTubeDownloadBot:
     async def handle_resolution_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle resolution selection from inline keyboard."""
         query = update.callback_query
-        await query.answer()
+        
+        try:
+            await query.answer()
+        except Exception as e:
+            if "too old" in str(e).lower() or "timeout" in str(e).lower():
+                logger.warning(f"Callback query expired: {e}")
+                await query.message.reply_text(
+                    "⚠️ <b>Button expired</b>\n"
+                    "This button has expired. Please send the YouTube URL again to get fresh options.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            else:
+                logger.error(f"Error answering callback query: {e}")
+                await query.answer()
         
         user_id = update.effective_user.id
         callback_data = query.data
+        
+        # Check if user state exists and is not too old
+        if user_id not in user_states:
+            await query.edit_message_text("❌ Session expired. Please send the URL again.")
+            return
+            
+        # Check if session is too old (more than 60 seconds)
+        if 'timestamp' in user_states[user_id]:
+            session_age = time.time() - user_states[user_id]['timestamp']
+            if session_age > self.callback_timeout:
+                await query.edit_message_text("❌ Session expired. Please send the URL again.")
+                if user_id in user_states:
+                    del user_states[user_id]
+                return
         
         if callback_data.startswith('res:'):
             # Single video download
             format_id = callback_data.split(':')[1]
             
-            if user_id not in user_states:
+            if 'video_info' not in user_states[user_id]:
                 await query.edit_message_text("❌ Session expired. Please send the URL again.")
                 return
                 
@@ -871,6 +902,15 @@ class YouTubeDownloadBot:
         """Handle errors."""
         logger.error(f"Update {update} caused error {context.error}")
         
+        # Don't send error message for callback query timeout errors
+        if context.error and ("too old" in str(context.error).lower() or "timeout" in str(context.error).lower()):
+            if update and update.callback_query:
+                try:
+                    await update.callback_query.answer("Button expired. Please try again.", show_alert=True)
+                except:
+                    pass
+            return
+        
         if update and update.effective_message:
             try:
                 error_msg = str(context.error)[:200]
@@ -988,6 +1028,7 @@ def main():
     logger.info(f"🍪 Cookies directory: {COOKIES_DIR}")
     logger.info(f"🌐 Health server port: {PORT}")
     logger.info("🔄 Retry logic: ENABLED (max 3 retries, exponential backoff)")
+    logger.info("⏱️ Callback timeout: 60 seconds")
     
     # Start the bot with polling
     try:
