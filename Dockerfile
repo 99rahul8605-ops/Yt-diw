@@ -25,6 +25,10 @@ RUN mkdir -p temp cookies logs
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV BOT_TOKEN=your_bot_token_here
+ENV PORT=8080
+
+# Expose the port
+EXPOSE 8080
 
 # Run the bot
 CMD ["python", "bot.py"]
