@@ -1,0 +1,15 @@
+[Unit]
+Description=YouTube Downloader Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/youtube-bot
+Environment="TELEGRAM_BOT_TOKEN=your_token_here"
+ExecStart=/opt/youtube-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
