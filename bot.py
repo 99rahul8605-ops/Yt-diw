@@ -517,4 +517,38 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
-    application.add_handler(
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("update_cookies", bot.update_cookies))
+    application.add_handler(CommandHandler("status", bot.status_command))
+    
+    # Handle cookies file
+    application.add_handler(MessageHandler(
+        filters.Document.ALL & filters.ChatType.PRIVATE,
+        bot.handle_cookies_file
+    ))
+    
+    # Handle YouTube URLs
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        bot.handle_text_message
+    ))
+    
+    # Handle bulk files
+    application.add_handler(MessageHandler(
+        filters.Document.FileExtension("txt") & filters.ChatType.PRIVATE,
+        bot.handle_bulk_file
+    ))
+    
+    # Handle inline keyboard buttons
+    application.add_handler(CallbackQueryHandler(bot.handle_resolution_selection))
+    
+    # Error handler
+    application.add_error_handler(bot.error_handler)
+    
+    # Start the bot
+    print("🤖 Bot is starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
