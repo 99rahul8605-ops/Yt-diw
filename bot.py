@@ -7,10 +7,12 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import signal
 import sys
+import json
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -18,12 +20,10 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     filters,
     ContextTypes
 )
 from telegram.constants import ParseMode
-from telegram.helpers import escape_markdown
 
 from utils.youtube_downloader import YouTubeDownloader
 from utils.cookie_manager import CookieManager
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", 10000))  # Render uses port 10000 by default
+PORT = int(os.getenv("PORT", 10000))
 MAX_FILE_SIZE = 2000 * 1024 * 1024
 TEMP_DIR = Path("temp")
 COOKIES_DIR = Path("cookies")
@@ -49,6 +49,9 @@ COOKIES_DIR = Path("cookies")
 # Ensure directories exist
 TEMP_DIR.mkdir(exist_ok=True)
 COOKIES_DIR.mkdir(exist_ok=True)
+
+# Thread pool for blocking operations
+executor = ThreadPoolExecutor(max_workers=4)
 
 # Store user states
 user_states: Dict[int, Dict] = {}
@@ -60,42 +63,39 @@ class YouTubeDownloadBot:
         self.downloader = YouTubeDownloader(self.cookie_manager)
         self.progress_handler = ProgressHandler()
     
-    def _escape_markdown_v2(self, text: str) -> str:
-        """Escape special characters for MarkdownV2 using Telegram's helper."""
-        return escape_markdown(text, version=2)
-    
-    def _safe_user_name(self, user) -> str:
-        """Get a safe version of the user's name for display."""
+    def _clean_name(self, user) -> str:
+        """Clean user name by removing problematic characters."""
         if user.first_name:
+            # Remove high Unicode characters and emojis that break parsing
             name = user.first_name
-            # Clean up problematic Unicode
-            name = ''.join(char for char in name if ord(char) < 65536)
+            # Keep only basic printable characters
+            name = ''.join(char for char in name if 32 <= ord(char) < 127 or 0x0400 <= ord(char) <= 0x04FF)
             name = name.strip()
             if not name:
                 name = user.username or "User"
-            return self._escape_markdown_v2(name)
-        return self._escape_markdown_v2(user.username or "User")
+            return name
+        return user.username or "User"
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a welcome message when /start is issued."""
         user = update.effective_user
-        safe_name = self._safe_user_name(user)
+        safe_name = self._clean_name(user)
         
-        # Using Markdown instead of MarkdownV2 for simpler formatting
+        # Use HTML formatting which handles Unicode better
         welcome_message = (
-            f"🎬 Welcome {safe_name} to YouTube Downloader Bot!\n\n"
-            "📥 *Features:*\n"
+            f"🎬 Welcome {html.escape(safe_name)} to YouTube Downloader Bot!\n\n"
+            "📥 <b>Features:</b>\n"
             "• Download individual YouTube videos\n"
             "• Bulk download via .txt file\n"
             "• Multiple resolution options\n"
             "• Update YouTube cookies\n"
             "• Real-time progress tracking\n\n"
-            "📝 *How to use:*\n"
+            "📝 <b>How to use:</b>\n"
             "1. Send a YouTube link directly\n"
             "2. Or send a .txt file with multiple links\n"
             "3. Use /update_cookies to add cookies file\n"
             "4. Use /help for more info\n\n"
-            "🔧 *Commands:*\n"
+            "🔧 <b>Commands:</b>\n"
             "/start - Start the bot\n"
             "/help - Show help message\n"
             "/update_cookies - Update YouTube cookies\n"
@@ -104,7 +104,7 @@ class YouTubeDownloadBot:
             "/cancel - Cancel current operation\n"
         )
         
-        await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
         
         # Check if cookies are configured
         user_id = update.effective_user.id
@@ -112,39 +112,39 @@ class YouTubeDownloadBot:
         
         if not cookie_status['has_cookies']:
             cookies_note = (
-                "\n⚠️ *Note:* You haven't configured cookies yet.\n"
+                "\n⚠️ <b>Note:</b> You haven't configured cookies yet.\n"
                 "Some videos may require cookies to download.\n"
                 "Use /update_cookies to add cookies file."
             )
-            await update.message.reply_text(cookies_note, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(cookies_note, parse_mode=ParseMode.HTML)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a help message."""
         help_text = (
-            "🤖 *YouTube Downloader Bot Help*\n\n"
-            "📥 *Download Single Video:*\n"
+            "🤖 <b>YouTube Downloader Bot Help</b>\n\n"
+            "📥 <b>Download Single Video:</b>\n"
             "1. Send any YouTube URL\n"
             "2. Choose resolution from buttons\n"
             "3. Wait for download & upload\n\n"
-            "📁 *Bulk Download:*\n"
+            "📁 <b>Bulk Download:</b>\n"
             "1. Send a .txt file containing YouTube URLs\n"
             "2. Each URL should be on a new line\n"
             "3. Choose resolution for all videos\n"
             "4. Bot will process each video\n\n"
-            "🍪 *Update Cookies:*\n"
+            "🍪 <b>Update Cookies:</b>\n"
             "1. Use /update_cookies command\n"
             "2. Send cookies.txt file\n"
             "3. Cookies help with age-restricted videos\n\n"
-            "⚡ *Progress Tracking:*\n"
+            "⚡ <b>Progress Tracking:</b>\n"
             "• 🔄 Downloading... shows download progress\n"
             "• 📤 Uploading... shows upload progress\n"
             "• ✅ Complete when finished\n\n"
-            "⚠️ *Limitations:*\n"
+            "⚠️ <b>Limitations:</b>\n"
             "• Max file size: 2GB (Telegram limit)\n"
             "• Supported formats: MP4, WebM\n"
             "• Keep cookies updated for best results\n"
         )
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
     async def update_cookies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Initiate cookie update process."""
@@ -152,19 +152,19 @@ class YouTubeDownloadBot:
         waiting_for_cookies[user_id] = True
         
         instructions = (
-            "🍪 *Update YouTube Cookies*\n\n"
-            "*Why cookies?*\n"
+            "🍪 <b>Update YouTube Cookies</b>\n\n"
+            "<b>Why cookies?</b>\n"
             "• Download age-restricted videos\n"
             "• Avoid 'Sign in to confirm you're not a bot' errors\n"
             "• Access private/unlisted videos\n\n"
-            "*How to get cookies:*\n"
+            "<b>How to get cookies:</b>\n"
             "1. Install 'Get cookies.txt' browser extension\n"
             "2. Login to YouTube in your browser\n"
             "3. Go to any YouTube video\n"
             "4. Click the extension and export cookies\n"
             "5. Send the cookies.txt file to this bot\n\n"
-            "*Privacy:* Your cookies are stored securely and only used for downloading.\n\n"
-            "👇 *Now send me your cookies.txt file:*\n"
+            "<b>Privacy:</b> Your cookies are stored securely and only used for downloading.\n\n"
+            "👇 <b>Now send me your cookies.txt file:</b>\n"
             "(or send /cancel to cancel)"
         )
         
@@ -172,36 +172,36 @@ class YouTubeDownloadBot:
         cookie_status = self.cookie_manager.get_cookies_status(user_id)
         
         if cookie_status['has_cookies']:
-            instructions += f"\n\n📊 *Current Status:*\n{cookie_status['message']}"
+            instructions += f"\n\n📊 <b>Current Status:</b>\n{cookie_status['message']}"
         
-        await update.message.reply_text(instructions, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(instructions, parse_mode=ParseMode.HTML)
 
     async def cookies_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Detailed help for cookies troubleshooting."""
         help_text = (
-            "🔧 *Cookies Troubleshooting Guide*\n\n"
-            "*Common Issues & Solutions:*\n\n"
-            "1. *'Sign in to confirm you're not a bot' error*\n"
+            "🔧 <b>Cookies Troubleshooting Guide</b>\n\n"
+            "<b>Common Issues & Solutions:</b>\n\n"
+            "1. <b>'Sign in to confirm you're not a bot' error</b>\n"
             "   • Update your cookies using /update_cookies\n"
             "   • Make sure you're logged into YouTube in browser\n"
             "   • Export cookies while on youtube.com\n\n"
-            "2. *Age-restricted videos not downloading*\n"
+            "2. <b>Age-restricted videos not downloading</b>\n"
             "   • Cookies must contain login information\n"
             "   • Re-export cookies after fresh login\n"
             "   • Use Chrome for best results\n\n"
-            "3. *How to export cookies (Chrome):*\n"
+            "3. <b>How to export cookies (Chrome):</b>\n"
             "   a. Install 'Get cookies.txt' extension\n"
             "   b. Login to youtube.com\n"
             "   c. Click the extension icon\n"
             "   d. Click 'Export' button\n"
             "   e. Send the file to bot\n\n"
-            "4. *Still having issues?*\n"
+            "4. <b>Still having issues?</b>\n"
             "   • Try clearing browser cookies and re-login\n"
             "   • Use Incognito mode for clean cookies\n"
             "   • Contact support if problem persists\n"
         )
         
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel the current operation."""
@@ -287,13 +287,13 @@ class YouTubeDownloadBot:
                 if verification:
                     final_message = (
                         f"{result['message']}\n\n"
-                        f"🔍 *Verification:* ✅ Working!\n"
+                        f"🔍 <b>Verification:</b> ✅ Working!\n"
                         f"You can now download all types of videos."
                     )
                 else:
                     final_message = (
                         f"{result['message']}\n\n"
-                        f"⚠️ *Note:* Cookies saved but may need refresh.\n"
+                        f"⚠️ <b>Note:</b> Cookies saved but may need refresh.\n"
                         "Try downloading a video to test."
                     )
                 
@@ -303,7 +303,7 @@ class YouTubeDownloadBot:
             else:
                 final_message = result['message']
             
-            await status_msg.edit_text(final_message, parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(final_message, parse_mode=ParseMode.HTML)
             
             # Cleanup
             temp_path.unlink(missing_ok=True)
@@ -364,18 +364,18 @@ class YouTubeDownloadBot:
                 
             # Show summary
             summary = (
-                f"📁 *Bulk Download Detected*\n\n"
-                f"📊 *Files found:* {len(urls)} lines\n"
-                f"✅ *Valid YouTube URLs:* {len(valid_urls)}\n"
+                f"📁 <b>Bulk Download Detected</b>\n\n"
+                f"📊 <b>Files found:</b> {len(urls)} lines\n"
+                f"✅ <b>Valid YouTube URLs:</b> {len(valid_urls)}\n"
             )
             
             if invalid_urls:
-                summary += f"❌ *Invalid URLs:* {len(invalid_urls)}\n"
+                summary += f"❌ <b>Invalid URLs:</b> {len(invalid_urls)}\n"
                 if len(invalid_urls) <= 5:
-                    summary += "\nInvalid URLs:\n"
+                    summary += "\n<b>Invalid URLs:</b>\n"
                     for url in invalid_urls[:5]:
-                        escaped_url = self._escape_markdown_v2(url[:50])
-                        summary += f"• {escaped_url}...\n"
+                        safe_url = html.escape(url[:50])
+                        summary += f"• {safe_url}...\n"
             
             # Ask for resolution
             keyboard = [
@@ -393,7 +393,7 @@ class YouTubeDownloadBot:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            summary += f"\n👇 *Select resolution for {len(valid_urls)} videos:*"
+            summary += f"\n👇 <b>Select resolution for {len(valid_urls)} videos:</b>"
             
             # Store bulk info
             user_states[user_id] = {
@@ -406,7 +406,7 @@ class YouTubeDownloadBot:
             await update.message.reply_text(
                 summary,
                 reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.HTML
             )
             
             # Cleanup
@@ -414,10 +414,10 @@ class YouTubeDownloadBot:
             
         except Exception as e:
             logger.error(f"Error handling bulk file: {e}")
-            error_msg = self._escape_markdown_v2(str(e)[:200])
+            error_msg = html.escape(str(e)[:200])
             await update.message.reply_text(
                 f"❌ Error processing bulk file:\n{error_msg}",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.HTML
             )
 
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,18 +479,18 @@ class YouTubeDownloadBot:
             
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            # Escape title for Markdown
-            safe_title = self._escape_markdown_v2(video_info['title'])
-            safe_channel = self._escape_markdown_v2(video_info['channel'])
+            # Escape title for HTML
+            safe_title = html.escape(video_info['title'])
+            safe_channel = html.escape(video_info['channel'])
             
             # Send video info with thumbnail
             caption = (
-                f"🎬 *{safe_title}*\n\n"
-                f"📊 *Duration:* {video_info['duration_string']}\n"
-                f"👁️ *Views:* {video_info['view_count']:,}\n"
-                f"👤 *Channel:* {safe_channel}\n"
-                f"📅 *Upload Date:* {video_info['upload_date']}\n\n"
-                f"👇 *Select Resolution:*"
+                f"🎬 <b>{safe_title}</b>\n\n"
+                f"📊 <b>Duration:</b> {video_info['duration_string']}\n"
+                f"👁️ <b>Views:</b> {video_info['view_count']:,}\n"
+                f"👤 <b>Channel:</b> {safe_channel}\n"
+                f"📅 <b>Upload Date:</b> {video_info['upload_date']}\n\n"
+                f"👇 <b>Select Resolution:</b>"
             )
             
             # Send thumbnail if available
@@ -499,19 +499,19 @@ class YouTubeDownloadBot:
                     await update.message.reply_photo(
                         photo=video_info['thumbnail'],
                         caption=caption,
-                        parse_mode=ParseMode.MARKDOWN,
+                        parse_mode=ParseMode.HTML,
                         reply_markup=reply_markup
                     )
                 except:
                     await update.message.reply_text(
                         caption,
-                        parse_mode=ParseMode.MARKDOWN,
+                        parse_mode=ParseMode.HTML,
                         reply_markup=reply_markup
                     )
             else:
                 await update.message.reply_text(
                     caption,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.HTML,
                     reply_markup=reply_markup
                 )
                 
@@ -519,7 +519,7 @@ class YouTubeDownloadBot:
             
         except Exception as e:
             logger.error(f"Error getting video info: {e}")
-            error_msg = self._escape_markdown_v2(str(e)[:200])
+            error_msg = html.escape(str(e)[:200])
             await status_msg.edit_text(
                 f"❌ Error fetching video information:\n{error_msg}"
             )
@@ -559,21 +559,21 @@ class YouTubeDownloadBot:
     async def download_and_send_video(self, query, video_url, format_id, user_id, video_info):
         """Download and send a single video."""
         try:
-            # Escape title for Markdown
-            safe_title = self._escape_markdown_v2(video_info['title'])
+            # Escape title for HTML
+            safe_title = html.escape(video_info['title'])
             
             # Update status
             status_msg = await query.message.reply_text(
-                f"⏬ *Starting download...*\n"
-                f"🎬 *{safe_title[:50]}...*\n"
-                f"🎯 *Quality:* {format_id if format_id != 'best' else 'Best Available'}"
+                f"⏬ <b>Starting download...</b>\n"
+                f"🎬 <b>{safe_title[:50]}...</b>\n"
+                f"🎯 <b>Quality:</b> {format_id if format_id != 'best' else 'Best Available'}"
             )
             
             # Create progress handler
             progress_msg = await query.message.reply_text(
-                f"📥 *Downloading:* {safe_title[:50]}...\n"
-                f"📊 *Progress:* 0%\n"
-                f"🔄 *Status:* Preparing..."
+                f"📥 <b>Downloading:</b> {safe_title[:50]}...\n"
+                f"📊 <b>Progress:</b> 0%\n"
+                f"🔄 <b>Status:</b> Preparing..."
             )
             
             # Download with progress
@@ -587,33 +587,33 @@ class YouTubeDownloadBot:
             )
             
             if not download_result['success']:
-                error_msg = self._escape_markdown_v2(download_result.get('error', 'Unknown error'))
+                error_msg = html.escape(download_result.get('error', 'Unknown error'))
                 await progress_msg.edit_text(
-                    f"❌ *Download failed*\n"
-                    f"*Error:* {error_msg}"
+                    f"❌ <b>Download failed</b>\n"
+                    f"<b>Error:</b> {error_msg}"
                 )
                 await status_msg.delete()
                 return
                 
             # Upload to Telegram
             await progress_msg.edit_text(
-                f"✅ *Download Complete!*\n"
-                f"📤 *Now Uploading to Telegram...*\n"
-                f"📦 *Size:* {download_result['file_size_mb']:.1f} MB\n"
-                f"⏳ *Progress:* 0%"
+                f"✅ <b>Download Complete!</b>\n"
+                f"📤 <b>Now Uploading to Telegram...</b>\n"
+                f"📦 <b>Size:</b> {download_result['file_size_mb']:.1f} MB\n"
+                f"⏳ <b>Progress:</b> 0%"
             )
             
             # Escape title for caption
-            safe_caption_title = self._escape_markdown_v2(video_info['title'])
-            safe_channel = self._escape_markdown_v2(video_info['channel'])
+            safe_caption_title = html.escape(video_info['title'])
+            safe_channel = html.escape(video_info['channel'])
             
             # Create caption
             caption = (
-                f"🎬 *{safe_caption_title}*\n"
-                f"📊 *Quality:* {download_result.get('resolution_display', download_result['resolution'])}\n"
-                f"📦 *Size:* {download_result['file_size_mb']:.1f} MB\n"
-                f"⏱️ *Duration:* {video_info['duration_string']}\n"
-                f"👤 *Channel:* {safe_channel}\n\n"
+                f"🎬 <b>{safe_caption_title}</b>\n"
+                f"📊 <b>Quality:</b> {download_result.get('resolution_display', download_result['resolution'])}\n"
+                f"📦 <b>Size:</b> {download_result['file_size_mb']:.1f} MB\n"
+                f"⏱️ <b>Duration:</b> {video_info['duration_string']}\n"
+                f"👤 <b>Channel:</b> {safe_channel}\n\n"
                 f"✅ Downloaded via @YouTubeDownloaderBot"
             )
             
@@ -627,7 +627,7 @@ class YouTubeDownloadBot:
                             filename=download_result['filename']
                         ),
                         caption=caption,
-                        parse_mode=ParseMode.MARKDOWN,
+                        parse_mode=ParseMode.HTML,
                         duration=video_info['duration'],
                         width=download_result.get('width', 1280),
                         height=download_result.get('height', 720),
@@ -640,9 +640,9 @@ class YouTubeDownloadBot:
             except Exception as e:
                 logger.error(f"Error uploading video: {e}")
                 await query.message.reply_text(
-                    f"✅ *Download Complete!*\n"
-                    f"📦 *Size:* {download_result['file_size_mb']:.1f} MB\n\n"
-                    f"❌ *Upload failed:* {str(e)[:100]}\n"
+                    f"✅ <b>Download Complete!</b>\n"
+                    f"📦 <b>Size:</b> {download_result['file_size_mb']:.1f} MB\n\n"
+                    f"❌ <b>Upload failed:</b> {str(e)[:100]}\n"
                     f"The file was downloaded but couldn't be sent to Telegram."
                 )
             
@@ -659,9 +659,9 @@ class YouTubeDownloadBot:
             
         except Exception as e:
             logger.error(f"Error in download_and_send_video: {e}")
-            error_msg = self._escape_markdown_v2(str(e)[:200])
+            error_msg = html.escape(str(e)[:200])
             await query.message.reply_text(
-                f"❌ *Error processing video:*\n{error_msg}"
+                f"❌ <b>Error processing video:</b>\n{error_msg}"
             )
 
     async def process_bulk_download(self, query, user_id, format_id, video_count):
@@ -674,10 +674,10 @@ class YouTubeDownloadBot:
         urls = bulk_info['bulk_urls']
         
         await query.edit_message_text(
-            f"📁 *Bulk Download Started*\n\n"
-            f"📊 *Total Videos:* {len(urls)}\n"
-            f"🎯 *Quality:* {format_id if format_id != 'best' else 'Best Available'}\n"
-            f"⏳ *Processing...*"
+            f"📁 <b>Bulk Download Started</b>\n\n"
+            f"📊 <b>Total Videos:</b> {len(urls)}\n"
+            f"🎯 <b>Quality:</b> {format_id if format_id != 'best' else 'Best Available'}\n"
+            f"⏳ <b>Processing...</b>"
         )
         
         success_count = 0
@@ -688,7 +688,7 @@ class YouTubeDownloadBot:
             try:
                 # Status message
                 status_msg = await query.message.reply_text(
-                    f"🔄 *Processing {i}/{len(urls)}*\n"
+                    f"🔄 <b>Processing {i}/{len(urls)}</b>\n"
                     f"📥 Getting video info..."
                 )
                 
@@ -697,7 +697,7 @@ class YouTubeDownloadBot:
                 
                 if not video_info:
                     await status_msg.edit_text(
-                        f"❌ *Failed {i}/{len(urls)}*\n"
+                        f"❌ <b>Failed {i}/{len(urls)}</b>\n"
                         f"Could not get video info"
                     )
                     failed_count += 1
@@ -705,10 +705,10 @@ class YouTubeDownloadBot:
                     await asyncio.sleep(2)
                     continue
                 
-                safe_title = self._escape_markdown_v2(video_info['title'][:50])
+                safe_title = html.escape(video_info['title'][:50])
                 await status_msg.edit_text(
-                    f"🔄 *Processing {i}/{len(urls)}*\n"
-                    f"🎬 *{safe_title}...*\n"
+                    f"🔄 <b>Processing {i}/{len(urls)}</b>\n"
+                    f"🎬 <b>{safe_title}...</b>\n"
                     f"📥 Downloading..."
                 )
                 
@@ -723,7 +723,7 @@ class YouTubeDownloadBot:
                 if download_result['success']:
                     # Send video
                     try:
-                        safe_video_title = self._escape_markdown_v2(video_info['title'][:100])
+                        safe_video_title = html.escape(video_info['title'][:100])
                         with open(download_result['filepath'], 'rb') as video_file:
                             await query.message.reply_video(
                                 video=InputFile(video_file),
@@ -733,16 +733,16 @@ class YouTubeDownloadBot:
                         success_count += 1
                         
                         await status_msg.edit_text(
-                            f"✅ *Completed {i}/{len(urls)}*\n"
-                            f"🎬 *{safe_title}...*"
+                            f"✅ <b>Completed {i}/{len(urls)}</b>\n"
+                            f"🎬 <b>{safe_title}...</b>"
                         )
                         
                     except Exception as e:
-                        error_msg = self._escape_markdown_v2(str(e)[:100])
+                        error_msg = html.escape(str(e)[:100])
                         await status_msg.edit_text(
-                            f"⚠️ *Downloaded but upload failed {i}/{len(urls)}*\n"
-                            f"🎬 *{safe_title}...*\n"
-                            f"Error: {error_msg}"
+                            f"⚠️ <b>Downloaded but upload failed {i}/{len(urls)}</b>\n"
+                            f"🎬 <b>{safe_title}...</b>\n"
+                            f"<b>Error:</b> {error_msg}"
                         )
                         failed_count += 1
                         failed_videos.append(f"{video_info['title']} - Upload failed")
@@ -750,11 +750,11 @@ class YouTubeDownloadBot:
                     # Cleanup
                     Path(download_result['filepath']).unlink(missing_ok=True)
                 else:
-                    error_msg = self._escape_markdown_v2(download_result.get('error', 'Unknown')[:100])
+                    error_msg = html.escape(download_result.get('error', 'Unknown')[:100])
                     await status_msg.edit_text(
-                        f"❌ *Failed {i}/{len(urls)}*\n"
-                        f"🎬 *{safe_title}...*\n"
-                        f"Error: {error_msg}"
+                        f"❌ <b>Failed {i}/{len(urls)}</b>\n"
+                        f"🎬 <b>{safe_title}...</b>\n"
+                        f"<b>Error:</b> {error_msg}"
                     )
                     failed_count += 1
                     failed_videos.append(f"{video_info['title']} - {download_result.get('error', 'Unknown')}")
@@ -765,33 +765,33 @@ class YouTubeDownloadBot:
             except Exception as e:
                 logger.error(f"Error in bulk download item {i}: {e}")
                 failed_count += 1
-                error_msg = self._escape_markdown_v2(str(e)[:100])
+                error_msg = html.escape(str(e)[:100])
                 failed_videos.append(f"URL {i} - {error_msg}")
                 
                 if 'status_msg' in locals():
                     await status_msg.edit_text(
-                        f"❌ *Error {i}/{len(urls)}*\n"
-                        f"Exception: {error_msg}"
+                        f"❌ <b>Error {i}/{len(urls)}</b>\n"
+                        f"<b>Exception:</b> {error_msg}"
                     )
         
         # Final report
         report = (
-            f"✅ *Bulk Download Complete!*\n\n"
-            f"📊 *Results:*\n"
-            f"✅ Successful: {success_count}\n"
-            f"❌ Failed: {failed_count}\n"
-            f"📁 Total: {len(urls)}\n"
+            f"✅ <b>Bulk Download Complete!</b>\n\n"
+            f"📊 <b>Results:</b>\n"
+            f"✅ <b>Successful:</b> {success_count}\n"
+            f"❌ <b>Failed:</b> {failed_count}\n"
+            f"📁 <b>Total:</b> {len(urls)}\n"
         )
         
         if failed_videos and len(failed_videos) <= 10:
-            report += "\n❌ *Failed videos:*\n"
+            report += "\n❌ <b>Failed videos:</b>\n"
             for failed in failed_videos[:10]:
-                safe_failed = self._escape_markdown_v2(failed[:80])
+                safe_failed = html.escape(failed[:80])
                 report += f"• {safe_failed}...\n"
         elif failed_videos:
-            report += f"\n❌ *Failed videos:* {len(failed_videos)} (too many to list)\n"
+            report += f"\n❌ <b>Failed videos:</b> {len(failed_videos)} (too many to list)\n"
         
-        await query.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text(report, parse_mode=ParseMode.HTML)
         
         # Cleanup user state
         if user_id in user_states:
@@ -813,16 +813,16 @@ class YouTubeDownloadBot:
             disk_info = "Unknown"
         
         status = (
-            "🤖 *Bot Status*\n\n"
-            "✅ *Operational*\n"
-            f"👤 *Your ID:* {user_id}\n"
-            f"🍪 *Cookies:* {cookie_status['message']}\n"
-            f"💾 *Storage:* {disk_info}\n"
-            f"⚡ *Version:* 2.1.0\n\n"
-            f"🔄 *Last Update:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🏠 *Host:* Render"
+            "🤖 <b>Bot Status</b>\n\n"
+            "✅ <b>Operational</b>\n"
+            f"👤 <b>Your ID:</b> {user_id}\n"
+            f"🍪 <b>Cookies:</b> {cookie_status['message']}\n"
+            f"💾 <b>Storage:</b> {disk_info}\n"
+            f"⚡ <b>Version:</b> 2.1.0\n\n"
+            f"🔄 <b>Last Update:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"🏠 <b>Host:</b> Render"
         )
-        await update.message.reply_text(status, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(status, parse_mode=ParseMode.HTML)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors."""
@@ -831,113 +831,87 @@ class YouTubeDownloadBot:
         if update and update.effective_message:
             try:
                 error_msg = str(context.error)[:200]
-                safe_error_msg = self._escape_markdown_v2(error_msg)
+                safe_error_msg = html.escape(error_msg)
                 await update.effective_message.reply_text(
-                    f"❌ An error occurred:\n`{safe_error_msg}`\n\n"
+                    f"❌ An error occurred:\n<code>{safe_error_msg}</code>\n\n"
                     "Please try again or contact support.",
-                    parse_mode=ParseMode.MARKDOWN
+                    parse_mode=ParseMode.HTML
                 )
             except Exception as e:
                 logger.error(f"Error in error handler: {e}")
 
-def start_flask_server():
-    """Start a simple Flask web server in a separate thread for Render."""
+def start_health_server():
+    """Start a simple health check server in a separate thread."""
     try:
-        from flask import Flask, jsonify
+        from http.server import HTTPServer, BaseHTTPRequestHandler
         import threading
         
-        app = Flask(__name__)
-        
-        @app.route('/')
-        def index():
-            return jsonify({
-                "status": "running",
-                "service": "YouTube Downloader Bot",
-                "version": "2.1.0",
-                "timestamp": datetime.now().isoformat()
-            })
-        
-        @app.route('/health')
-        def health():
-            return jsonify({"status": "healthy"}), 200
-        
-        # Run Flask in a separate thread
-        def run_flask():
-            app.run(host='0.0.0.0', port=PORT, threaded=True, debug=False)
-        
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        logger.info(f"🌐 Flask server started on port {PORT}")
-        logger.info(f"📡 Health check available at: http://0.0.0.0:{PORT}/health")
-        
-        return True
-    except ImportError:
-        logger.warning("Flask not installed. Web server will not start.")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to start Flask server: {e}")
-        return False
-
-def start_simple_http_server():
-    """Start a simple HTTP server in a separate thread."""
-    try:
-        import http.server
-        import socketserver
-        import threading
-        
-        handler = http.server.SimpleHTTPRequestHandler
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/health':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    response = {
+                        "status": "healthy",
+                        "service": "YouTube Downloader Bot",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    self.wfile.write(json.dumps(response).encode())
+                elif self.path == '/':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.end_headers()
+                    html_content = f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>YouTube Downloader Bot</title></head>
+                    <body>
+                        <h1>🎬 YouTube Downloader Bot</h1>
+                        <p>✅ Bot is running</p>
+                        <p>Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                    </body>
+                    </html>
+                    """
+                    self.wfile.write(html_content.encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def log_message(self, format, *args):
+                # Suppress access logs
+                pass
         
         def run_server():
-            with socketserver.TCPServer(("", PORT), handler) as httpd:
-                logger.info(f"🌐 Simple HTTP server started on port {PORT}")
-                httpd.serve_forever()
+            server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
+            logger.info(f"🌐 Health server started on port {PORT}")
+            server.serve_forever()
         
         server_thread = threading.Thread(target=run_server, daemon=True)
         server_thread.start()
         return True
     except Exception as e:
-        logger.error(f"Failed to start HTTP server: {e}")
+        logger.error(f"Failed to start health server: {e}")
         return False
-
-def start_web_server():
-    """Try to start a web server for Render health checks."""
-    logger.info(f"🚀 Attempting to start web server on port {PORT}")
-    
-    # Try Flask first, then simple HTTP server
-    if not start_flask_server():
-        if not start_simple_http_server():
-            logger.warning("⚠️ Could not start web server. Render may show as unhealthy.")
-            return False
-    return True
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals."""
-    logger.info(f"Received signal {signum}. Shutting down...")
-    sys.exit(0)
 
 def main():
     """Main function to start the bot."""
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable not set")
     
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Start web server for Render health checks (in separate thread)
-    web_server_started = start_web_server()
-    
-    if web_server_started:
-        logger.info(f"✅ Web server is running on port {PORT}")
-        logger.info("🔍 Render health checks should pass")
-    else:
-        logger.warning("❌ Web server failed to start")
+    # Start health server in background thread
+    start_health_server()
     
     bot = YouTubeDownloadBot()
     
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Create application with increased timeouts
+    application = Application.builder() \
+        .token(BOT_TOKEN) \
+        .connect_timeout(30.0) \
+        .read_timeout(30.0) \
+        .write_timeout(30.0) \
+        .pool_timeout(30.0) \
+        .build()
     
     # Add command handlers
     application.add_handler(CommandHandler("start", bot.start))
@@ -968,14 +942,15 @@ def main():
     logger.info("🤖 Starting YouTube Downloader Bot...")
     logger.info(f"📁 Temp directory: {TEMP_DIR}")
     logger.info(f"🍪 Cookies directory: {COOKIES_DIR}")
-    logger.info(f"🌐 Web server port: {PORT}")
+    logger.info(f"🌐 Health server port: {PORT}")
     
     # Start the bot with polling
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
-            close_loop=False  # Don't close the loop, we have other threads
+            poll_timeout=30,
+            close_loop=False
         )
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
