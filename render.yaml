@@ -13,8 +13,4 @@ services:
       - key: PORT
         value: 10000  # Render uses port 10000
     healthCheckPath: /health
-    disk:
-      name: temp-storage
-      mountPath: /opt/render/project/src/temp
-      sizeGB: 5
     autoDeploy: true
