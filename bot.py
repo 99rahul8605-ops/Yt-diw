@@ -63,6 +63,42 @@ class YouTubeDownloadBot:
         self.downloader = YouTubeDownloader(self.cookie_manager)
         self.progress_handler = ProgressHandler()
     
+    async def download_with_retry(self, url: str, format_id: str, user_id: int, 
+                                progress_callback=None, max_retries: int = 3, initial_delay: int = 5) -> Dict:
+        """Download with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                result = await self.downloader.download_video(url, format_id, user_id, progress_callback)
+                
+                if result['success']:
+                    return result
+                else:
+                    # Check if error is rate limiting
+                    if "429" in result.get('error', '') or "Too Many Requests" in result.get('error', ''):
+                        delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Rate limited, attempt {attempt + 1}/{max_retries}, waiting {delay}s")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Other error, don't retry
+                        return result
+                        
+            except Exception as e:
+                logger.error(f"Download attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                else:
+                    return {
+                        'success': False,
+                        'error': f'Failed after {max_retries} attempts: {str(e)[:200]}'
+                    }
+        
+        return {
+            'success': False,
+            'error': f'All {max_retries} download attempts failed'
+        }
+    
     def _clean_name(self, user) -> str:
         """Clean user name by removing problematic characters."""
         if user.first_name:
@@ -89,7 +125,8 @@ class YouTubeDownloadBot:
             "• Bulk download via .txt file\n"
             "• Multiple resolution options\n"
             "• Update YouTube cookies\n"
-            "• Real-time progress tracking\n\n"
+            "• Real-time progress tracking\n"
+            "• Automatic retry on failures\n\n"
             "📝 <b>How to use:</b>\n"
             "1. Send a YouTube link directly\n"
             "2. Or send a .txt file with multiple links\n"
@@ -125,7 +162,8 @@ class YouTubeDownloadBot:
             "📥 <b>Download Single Video:</b>\n"
             "1. Send any YouTube URL\n"
             "2. Choose resolution from buttons\n"
-            "3. Wait for download & upload\n\n"
+            "3. Wait for download & upload\n"
+            "4. Auto-retry on rate limits (up to 3 times)\n\n"
             "📁 <b>Bulk Download:</b>\n"
             "1. Send a .txt file containing YouTube URLs\n"
             "2. Each URL should be on a new line\n"
@@ -138,7 +176,8 @@ class YouTubeDownloadBot:
             "⚡ <b>Progress Tracking:</b>\n"
             "• 🔄 Downloading... shows download progress\n"
             "• 📤 Uploading... shows upload progress\n"
-            "• ✅ Complete when finished\n\n"
+            "• ✅ Complete when finished\n"
+            "• 🔁 Auto-retry on failures\n\n"
             "⚠️ <b>Limitations:</b>\n"
             "• Max file size: 2GB (Telegram limit)\n"
             "• Supported formats: MP4, WebM\n"
@@ -576,21 +615,24 @@ class YouTubeDownloadBot:
                 f"🔄 <b>Status:</b> Preparing..."
             )
             
-            # Download with progress
-            download_result = await self.downloader.download_video(
-                video_url,
-                format_id,
+            # Download with retry logic and progress callback
+            download_result = await self.download_with_retry(
+                video_url, 
+                format_id, 
                 user_id,
-                lambda p: self.progress_handler.update_download_progress(
+                progress_callback=lambda p: self.progress_handler.update_download_progress(
                     progress_msg, video_info['title'], p
-                )
+                ),
+                max_retries=3, 
+                initial_delay=5
             )
             
             if not download_result['success']:
                 error_msg = html.escape(download_result.get('error', 'Unknown error'))
                 await progress_msg.edit_text(
                     f"❌ <b>Download failed</b>\n"
-                    f"<b>Error:</b> {error_msg}"
+                    f"<b>Error:</b> {error_msg}\n\n"
+                    f"<i>Tip: Try again in a few minutes or update cookies.</i>"
                 )
                 await status_msg.delete()
                 return
@@ -712,12 +754,13 @@ class YouTubeDownloadBot:
                     f"📥 Downloading..."
                 )
                 
-                # Download
-                download_result = await self.downloader.download_video(
-                    url,
-                    format_id,
+                # Download with retry
+                download_result = await self.download_with_retry(
+                    url, 
+                    format_id, 
                     user_id,
-                    lambda p: None  # Simplified progress for bulk
+                    max_retries=2,  # Fewer retries for bulk to save time
+                    initial_delay=3
                 )
                 
                 if download_result['success']:
@@ -818,7 +861,7 @@ class YouTubeDownloadBot:
             f"👤 <b>Your ID:</b> {user_id}\n"
             f"🍪 <b>Cookies:</b> {cookie_status['message']}\n"
             f"💾 <b>Storage:</b> {disk_info}\n"
-            f"⚡ <b>Version:</b> 2.1.0\n\n"
+            f"⚡ <b>Version:</b> 2.2.0 (with retry logic)\n\n"
             f"🔄 <b>Last Update:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🏠 <b>Host:</b> Render"
         )
@@ -855,7 +898,8 @@ def start_health_server():
                     response = {
                         "status": "healthy",
                         "service": "YouTube Downloader Bot",
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": datetime.now().isoformat(),
+                        "features": ["retry_logic", "bulk_download", "cookies_support"]
                     }
                     self.wfile.write(json.dumps(response).encode())
                 elif self.path == '/':
@@ -868,7 +912,7 @@ def start_health_server():
                     <head><title>YouTube Downloader Bot</title></head>
                     <body>
                         <h1>🎬 YouTube Downloader Bot</h1>
-                        <p>✅ Bot is running</p>
+                        <p>✅ Bot is running with retry logic enabled</p>
                         <p>Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
                     </body>
                     </html>
@@ -943,6 +987,7 @@ def main():
     logger.info(f"📁 Temp directory: {TEMP_DIR}")
     logger.info(f"🍪 Cookies directory: {COOKIES_DIR}")
     logger.info(f"🌐 Health server port: {PORT}")
+    logger.info("🔄 Retry logic: ENABLED (max 3 retries, exponential backoff)")
     
     # Start the bot with polling
     try:
